@@ -1,41 +1,35 @@
 package com.ai.assistance.operit.ui.features.chat.webview.workspace.editor.language
 
+import android.util.Log
+
 /**
- * 语言工厂类，用于初始化和获取所有语言支持
+ * 语言支持工厂
+ * Monaco Editor通过WebView加载，语言支持由Monaco自动处理
  */
 object LanguageFactory {
+    private const val TAG = "LanguageFactory"
+    private var initialized = false
+
     /**
-     * 初始化所有语言支持
+     * 初始化语言工厂
+     * Monaco Editor使用时不需要额外的初始化
      */
     fun init() {
-        // 触发所有语言支持类的静态初始化
-        JavaScriptSupport
-        KotlinSupport
-        HtmlSupport
-        // 未来添加更多语言支持时，在这里添加
-        
-        // 初始化语言注册表
-        LanguageSupportRegistry.init()
+        if (initialized) {
+            Log.d(TAG, "LanguageFactory already initialized")
+            return
+        }
+
+        try {
+            Log.d(TAG, "LanguageFactory initialized (Monaco Editor handles language support)")
+            initialized = true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize LanguageFactory", e)
+        }
     }
-    
+
     /**
-     * 根据文件名获取语言支持
+     * 检查是否已初始化
      */
-    fun getLanguageSupportForFile(fileName: String): LanguageSupport? {
-        return LanguageSupportRegistry.getLanguageSupportForFile(fileName)
-    }
-    
-    /**
-     * 根据语言名称获取语言支持
-     */
-    fun getLanguageSupport(language: String): LanguageSupport? {
-        return LanguageSupportRegistry.getLanguageSupport(language)
-    }
-    
-    /**
-     * 获取所有支持的语言
-     */
-    fun getSupportedLanguages(): Set<String> {
-        return LanguageSupportRegistry.getSupportedLanguages()
-    }
-} 
+    fun isInitialized(): Boolean = initialized
+}

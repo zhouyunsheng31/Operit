@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Monaco Editor</title>
+    <style>
+        html,
+        body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1e1e1e;
+        }
+
+        #container {
+            position: absolute;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+
+        #editor {
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="container">
+        <div id="editor"></div>
+    </div>
+
+    <!-- Monaco Editor Loader -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js"></script>
+    <script>
+        let editor;
+        let currentLanguage = 'plaintext';
+        let isUpdatingFromAndroid = false;
+
+        // 捕获错误并发送给 Android
+        window.onerror = function (msg, url, line, col, error) {
+            if (window.AndroidBridge && window.AndroidBridge.log) {
+                window.AndroidBridge.log(`JS Error: ${msg} at ${line}:${col}`);
+            }
+        };
+
+        // 配置 Monaco Environment 以解决 WebView 中的 Worker 加载问题
+        window.MonacoEnvironment = {
+            getWorkerUrl: function (workerId, label) {
+                return `data:text/javascript;charset=utf-8,${encodeURIComponent(`
+                    self.MonacoEnvironment = {
+                        baseUrl: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/'
+                    };
+                    importScripts('https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/base/worker/workerMain.js');`
+                )}`;
+            }
+        };
+
+        // Configure Monaco loader
+        require.config({
+            paths: {
+                'vs': 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs'
+            }
+        });
+
+        // Load Monaco Editor
+        require(['vs/editor/editor.main'], function () {
+            // Create editor instance
+            editor = monaco.editor.create(document.getElementById('editor'), {
+                value: '',
+                language: 'plaintext', // 初始语言，后面会通过 setLanguage 更新
+                theme: 'vs-dark',
+                automaticLayout: true,
+                fontSize: 14,
+                fontFamily: 'JetBrains Mono, Consolas, Monaco, monospace',
+                lineNumbers: 'on',
+                lineNumbersMinChars: 3,
+                roundedSelection: false,
+                scrollBeyondLastLine: true,
+                readOnly: false,
+                minimap: {
+                    enabled: true
+                },
+                scrollbar: {
+                    verticalScrollbarSize: 10,
+                    horizontalScrollbarSize: 10
+                },
+                wordWrap: 'off',
+                folding: true,
+                foldingHighlight: true,
+                glyphMargin: false,
+                lineDecorationsWidth: 0,
+                contextmenu: true,
+                renderWhitespace: 'selection',
+                renderControlCharacters: false,
+                quickSuggestions: {
+                    other: true,
+                    comments: false,
+                    strings: false
+                },
+                suggestOnTriggerCharacters: true,
+                acceptSuggestionOnEnter: 'on',
+                tabCompletion: 'on',
+                wordBasedSuggestions: true
+            });
+
+            // 移动端长按选择适配
+            let longPressTimer;
+            let isSelectionMode = false;
+            let selectionAnchor = null;
+            let autoScrollTimer = null; // 自动滚动定时器
+            const longPressDuration = 400; // 长按时间阈值(ms)
+            const moveThreshold = 10; // 移动阈值
+            const scrollSpeed = 15; // 滚动速度(px)
+            let startX, startY;
+
+            const editorDom = editor.getDomNode();
+
+            // 阻止默认右键菜单
+            editorDom.addEventListener('contextmenu', function (e) {
+                e.preventDefault();
+                return false;
+            });
+
+            // 监听光标变化，确保光标始终在视口中间（防止被键盘遮挡）
+            editor.onDidChangeCursorPosition(function (e) {
+                if (!isSelectionMode) {
+                    // 只有在非选择模式（如打字、点击）时才强制居中
+                    // 也就是用户主动移动光标时
+                    editor.revealPositionInCenter(e.position);
+                }
+            });
+
+            editorDom.addEventListener('touchstart', function (e) {
+                if (e.touches.length === 1) {
+                    const touch = e.touches[0];
+                    startX = touch.clientX;
+                    startY = touch.clientY;
+
+                    longPressTimer = setTimeout(function () {
+                        // 长按触发
+                        isSelectionMode = true;
+
+                        // 获取当前触摸点位置作为选择起点
+                        const target = editor.getTargetAtClientPoint(touch.clientX, touch.clientY);
+                        if (target && target.position) {
+                            selectionAnchor = target.position;
+                            editor.setPosition(selectionAnchor);
+
+                            // 选中当前单词作为初始状态
+                            const word = editor.getModel().getWordAtPosition(selectionAnchor);
+                            if (word) {
+                                editor.setSelection({
+                                    startLineNumber: selectionAnchor.lineNumber,
+                                    startColumn: word.startColumn,
+                                    endLineNumber: selectionAnchor.lineNumber,
+                                    endColumn: word.endColumn
+                                });
+                            }
+                        }
+                    }, longPressDuration);
+                }
+            }, { passive: false });
+
+            editorDom.addEventListener('touchmove', function (e) {
+                if (e.touches.length === 1) {
+                    const touch = e.touches[0];
+
+                    if (isSelectionMode) {
+                        // 选择模式下，阻止默认滚动，并更新选区
+                        e.preventDefault();
+                        e.stopPropagation();
+
+                        const target = editor.getTargetAtClientPoint(touch.clientX, touch.clientY);
+                        if (target && target.position) {
+                            const currentPos = target.position;
+
+                            // 更新选区：从 anchor 到 current
+                            editor.setSelection({
+                                startLineNumber: selectionAnchor.lineNumber,
+                                startColumn: selectionAnchor.column,
+                                endLineNumber: currentPos.lineNumber,
+                                endColumn: currentPos.column
+                            });
+
+                            // 自动滚动页面以显示当前拖拽位置
+                            // 强制将当前行滚动到屏幕中间 (1 = ScrollType.Immediate)
+                            editor.revealPositionInCenter(currentPos, 1);
+                        }
+                    } else {
+                        // 非选择模式，检测是否移动超过阈值（取消长按）
+                        if (longPressTimer) {
+                            const deltaX = Math.abs(touch.clientX - startX);
+                            const deltaY = Math.abs(touch.clientY - startY);
+                            if (deltaX > moveThreshold || deltaY > moveThreshold) {
+                                clearTimeout(longPressTimer);
+                                longPressTimer = null;
+                            }
+                        }
+                    }
+                }
+            }, { passive: false });
+
+            editorDom.addEventListener('touchend', function (e) {
+                if (longPressTimer) {
+                    clearTimeout(longPressTimer);
+                    longPressTimer = null;
+                }
+
+                if (isSelectionMode) {
+                    isSelectionMode = false;
+                    selectionAnchor = null;
+
+                    // 选择结束，弹出Monaco上下文菜单
+                    setTimeout(function () {
+                        // editor.focus(); // 移除强制聚焦，防止唤起键盘
+                        editor.trigger('touch', 'editor.action.showContextMenu', {});
+                    }, 100);
+                }
+            });
+
+            // Listen for content changes
+            editor.onDidChangeModelContent(function (e) {
+                if (!isUpdatingFromAndroid && window.AndroidBridge) {
+                    const content = editor.getValue();
+                    window.AndroidBridge.onContentChanged(content);
+                }
+            });
+
+            // Notify Android that editor is ready
+            if (window.AndroidBridge) {
+                window.AndroidBridge.onEditorReady();
+            }
+        });
+
+        // API for Android to call
+        window.monacoAPI = {
+            setValue: function (content) {
+                if (editor) {
+                    isUpdatingFromAndroid = true;
+                    editor.setValue(content);
+                    isUpdatingFromAndroid = false;
+                }
+            },
+
+            getValue: function () {
+                return editor ? editor.getValue() : '';
+            },
+
+            setLanguage: function (language) {
+                if (editor) {
+                    currentLanguage = language;
+                    monaco.editor.setModelLanguage(editor.getModel(), language);
+                }
+            },
+
+            insertText: function (text) {
+                if (editor) {
+                    const selection = editor.getSelection();
+                    const id = { major: 1, minor: 1 };
+                    const op = {
+                        identifier: id,
+                        range: selection,
+                        text: text,
+                        forceMoveMarkers: true
+                    };
+                    editor.executeEdits('insertText', [op]);
+                }
+            },
+
+            undo: function () {
+                if (editor) {
+                    editor.trigger('keyboard', 'undo', null);
+                }
+            },
+
+            redo: function () {
+                if (editor) {
+                    editor.trigger('keyboard', 'redo', null);
+                }
+            },
+
+            setTheme: function (theme) {
+                if (editor) {
+                    monaco.editor.setTheme(theme);
+                }
+            },
+
+            setReadOnly: function (readOnly) {
+                if (editor) {
+                    editor.updateOptions({ readOnly: readOnly });
+                }
+            },
+
+            focus: function () {
+                if (editor) {
+                    editor.focus();
+                }
+            },
+
+            getSelectedText: function () {
+                if (editor) {
+                    const selection = editor.getSelection();
+                    const model = editor.getModel();
+                    return model.getValueInRange(selection);
+                }
+                return '';
+            },
+
+            setSelection: function (startLine, startColumn, endLine, endColumn) {
+                if (editor) {
+                    editor.setSelection({
+                        startLineNumber: startLine,
+                        startColumn: startColumn,
+                        endLineNumber: endLine,
+                        endColumn: endColumn
+                    });
+                }
+            },
+
+            setFontSize: function (size) {
+                if (editor) {
+                    editor.updateOptions({ fontSize: size });
+                }
+            },
+
+            setWordWrap: function (enabled) {
+                if (editor) {
+                    editor.updateOptions({ wordWrap: enabled ? 'on' : 'off' });
+                }
+            },
+
+            layout: function () {
+                if (editor) {
+                    editor.layout();
+                }
+            }
+        };
+    </script>
+</body>
+
+</html>

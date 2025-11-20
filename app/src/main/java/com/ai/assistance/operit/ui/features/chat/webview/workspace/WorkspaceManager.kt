@@ -32,7 +32,7 @@ import com.ai.assistance.operit.data.model.ToolParameter
 import com.ai.assistance.operit.ui.common.rememberLocal
 import com.ai.assistance.operit.ui.features.chat.viewmodel.ChatViewModel
 import com.ai.assistance.operit.ui.features.chat.webview.WebViewHandler
-import com.ai.assistance.operit.ui.features.chat.webview.workspace.editor.CodeEditor
+import com.ai.assistance.operit.ui.features.chat.webview.workspace.editor.MonacoCodeEditor
 import com.ai.assistance.operit.ui.features.chat.webview.workspace.editor.LanguageDetector
 import kotlinx.coroutines.launch
 import java.io.File
@@ -99,6 +99,10 @@ fun WorkspaceManager(
     // 解绑确认对话框状态
     var showUnbindConfirmDialog by remember { mutableStateOf(false) }
     
+    // 关闭文件确认对话框状态
+    var showCloseConfirmDialog by remember { mutableStateOf(false) }
+    var fileToCloseIndex by remember { mutableStateOf(-1) }
+    
     // 当前活动的编辑器引用
     var activeEditor by remember { mutableStateOf<com.ai.assistance.operit.ui.features.chat.webview.workspace.editor.NativeCodeEditor?>(null) }
 
@@ -163,8 +167,8 @@ fun WorkspaceManager(
         }
     }
 
-    // 关闭文件标签
-    fun closeFile(index: Int) {
+    // 实际执行关闭文件操作
+    fun performCloseFile(index: Int) {
         if (index >= 0 && index < openFiles.size) {
             val fileToClose = openFiles[index]
             val updatedFiles = openFiles.toMutableList()
@@ -179,6 +183,19 @@ fun WorkspaceManager(
                 updatedFiles.isEmpty() -> -1
                 index >= updatedFiles.size -> updatedFiles.size - 1
                 else -> index
+            }
+        }
+    }
+
+    // 关闭文件标签（带确认）
+    fun closeFile(index: Int) {
+        if (index >= 0 && index < openFiles.size) {
+            val fileInfo = openFiles[index]
+            if (unsavedFiles.contains(fileInfo.path)) {
+                fileToCloseIndex = index
+                showCloseConfirmDialog = true
+            } else {
+                performCloseFile(index)
             }
         }
     }
@@ -328,27 +345,29 @@ fun WorkspaceManager(
                                     modifier = Modifier.fillMaxSize()
                             )
                         } else {
-                            // 其他所有情况（非HTML文件，或处于编辑模式的HTML文件）都使用CodeEditor
-                            key(fileInfo.path) {
-                                val fileLanguage = LanguageDetector.detectLanguage(fileInfo.name)
-                                CodeEditor(
-                                        code = fileInfo.content,
-                                        language = fileLanguage,
-                                        onCodeChange = { newContent ->
-                                            val updatedFiles = openFiles.toMutableList()
-                                            if (currentFileIndex in updatedFiles.indices) {
-                                                val updatedFile = openFiles[currentFileIndex].copy(content = newContent)
-                                                updatedFiles[currentFileIndex] = updatedFile
-                                                openFiles = updatedFiles
+                            // 其他所有情况（非HTML文件，或处于编辑模式的HTML文件）都使用MonacoCodeEditor
+                            // 移除 key() 包装，允许 MonacoCodeEditor 复用，通过 props 更新内容，避免 WebView 重新加载导致的闪烁
+                            val fileLanguage = LanguageDetector.detectLanguage(fileInfo.name)
+                            MonacoCodeEditor(
+                                    code = fileInfo.content,
+                                    language = fileLanguage,
+                                    onCodeChange = { newContent ->
+                                        val updatedFiles = openFiles.toMutableList()
+                                        if (currentFileIndex in updatedFiles.indices) {
+                                            val updatedFile = openFiles[currentFileIndex].copy(content = newContent)
+                                            updatedFiles[currentFileIndex] = updatedFile
+                                            openFiles = updatedFiles
 
-                                                // 将文件标记为未保存
-                                                unsavedFiles = unsavedFiles + updatedFile.path
-                                            }
-                                        },
-                                        modifier = Modifier.fillMaxSize(),
-                                        editorRef = { editor -> activeEditor = editor } // 传递editor引用
-                                )
-                            }
+                                            // 将文件标记为未保存
+                                            unsavedFiles = unsavedFiles + updatedFile.path
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxSize(),
+                                    editorRef = { editor -> activeEditor = editor }, // 传递editor引用
+                                    theme = "vs-dark", // 使用暗色主题
+                                    fontSize = 14,
+                                    wordWrap = false
+                            )
                         }
                     }
                 }
@@ -436,6 +455,31 @@ fun WorkspaceManager(
                 },
                 dismissButton = {
                     TextButton(onClick = { showUnbindConfirmDialog = false }) {
+                        Text("取消")
+                    }
+                }
+            )
+        }
+        
+        // 关闭未保存文件确认对话框
+        if (showCloseConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showCloseConfirmDialog = false },
+                title = { Text("文件未保存") },
+                text = { Text("该文件已被修改但尚未保存，确定要关闭吗？关闭后将丢失未保存的更改。") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            performCloseFile(fileToCloseIndex)
+                            showCloseConfirmDialog = false
+                        },
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("放弃更改")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showCloseConfirmDialog = false }) {
                         Text("取消")
                     }
                 }

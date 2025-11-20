@@ -1,83 +1,79 @@
 package com.ai.assistance.operit.ui.features.chat.webview.workspace.editor
 
+import java.util.Locale
+
 /**
  * 根据文件名检测编程语言
  */
 object LanguageDetector {
+    
     /**
-     * 根据文件名获取编程语言
-     * @param fileName 文件名
-     * @return 编程语言标识符
+     * 根据文件名检测语言
      */
     fun detectLanguage(fileName: String): String {
-        val extension = fileName.substringAfterLast('.', "").lowercase()
-        
+        val extension = fileName.substringAfterLast('.', "").lowercase(Locale.getDefault())
         return when (extension) {
-            // Kotlin
-            "kt", "kts" -> "kotlin"
-            
-            // Java
+            // JVM语言
+            "kt" -> "kotlin"
             "java" -> "java"
+            "groovy", "gradle" -> "groovy"
+            "scala" -> "scala"
             
-            // JavaScript
-            "js", "mjs" -> "javascript"
+            // Web
+            "js", "mjs", "cjs" -> "javascript"
+            "ts" -> "typescript"
+            "jsx" -> "javascriptreact"
+            "tsx" -> "typescriptreact"
+            "html", "htm" -> "html"
+            "css" -> "css"
+            "scss" -> "scss"
+            "sass" -> "sass"
+            "less" -> "less"
+            "vue" -> "vue"
             
-            // TypeScript
-            "ts", "tsx" -> "typescript"
-            
-            // HTML
-            "html", "htm", "xhtml" -> "html"
-            
-            // CSS
-            "css", "scss", "sass", "less" -> "css"
-            
-            // XML
-            "xml", "svg", "xsd", "xsl" -> "xml"
-            
-            // JSON
-            "json" -> "json"
-            
-            // Markdown
-            "md", "markdown" -> "markdown"
-            
-            // Python
-            "py", "pyw", "pyc" -> "python"
-            
-            // C/C++
-            "c", "cpp", "cc", "h", "hpp" -> "cpp"
-            
-            // C#
-            "cs" -> "csharp"
-            
-            // PHP
-            "php", "phtml" -> "php"
-            
-            // Ruby
-            "rb", "rbw" -> "ruby"
-            
-            // Go
+            // 系统语言
+            "c" -> "c"
+            "cpp", "cxx", "cc", "h", "hpp" -> "cpp"
             "go" -> "go"
-            
-            // Rust
             "rs" -> "rust"
-            
-            // Swift
             "swift" -> "swift"
             
-            // Dart
-            "dart" -> "dart"
-            
-            // Shell
+            // 脚本语言
+            "py" -> "python"
+            "rb" -> "ruby"
+            "php" -> "php"
+            "pl" -> "perl"
+            "lua" -> "lua"
             "sh", "bash", "zsh" -> "shell"
+            "ps1" -> "powershell"
+            "bat", "cmd" -> "bat"
             
-            // SQL
+            // 数据格式
+            "json" -> "json"
+            "xml" -> "xml"
+            "yaml", "yml" -> "yaml"
+            "toml" -> "toml"
+            "ini" -> "ini"
+            "csv" -> "csv"
+            
+            // 标记语言
+            "md", "markdown" -> "markdown"
+            "tex" -> "latex"
+            "rst" -> "restructuredtext"
+            
+            // 查询语言
             "sql" -> "sql"
+            "graphql", "gql" -> "graphql"
             
-            // YAML
-            "yml", "yaml" -> "yaml"
+            // 配置文件
+            "dockerfile" -> "dockerfile"
+            "dockerignore" -> "ignore"
+            "gitignore" -> "ignore"
+            "properties" -> "properties"
             
             // 其他
-            else -> "text"
+            "txt" -> "plaintext"
+            else -> "plaintext"
         }
     }
-} 
+}
