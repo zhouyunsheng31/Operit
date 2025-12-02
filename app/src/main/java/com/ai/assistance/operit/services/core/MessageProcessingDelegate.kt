@@ -274,10 +274,12 @@ class MessageProcessingDelegate(
                 )
 
                 // 将字符串流共享，以便多个收集器可以使用
+                // 关键修改：设置 replay = Int.MAX_VALUE，确保 UI 重组（重新订阅）时能收到所有历史字符
+                // 文本数据占用内存极小，全量缓冲不会造成内存压力
                 val sharedCharStream =
                     responseStream.share(
                         scope = coroutineScope,
-                        replay = 0, // 不重放历史消息
+                        replay = Int.MAX_VALUE, 
                         onComplete = {
                             deferred.complete(Unit)
                             Log.d(
@@ -332,22 +334,20 @@ class MessageProcessingDelegate(
                     }
                 }
                 
-                // 启动一个独立的协程来收集流内容并持续更新数据库
+                // 启动一个独立的协程来收集流内容
+                // 注意：不再频繁更新 chatHistory，只收集内容到 aiMessage.content
+                // UI 会直接从 sharedCharStream 渲染，避免列表频繁重组
                 streamCollectionJob =
                     coroutineScope.launch(Dispatchers.IO) {
                         val contentBuilder = StringBuilder()
                         sharedCharStream.collect { chunk ->
                             contentBuilder.append(chunk)
                             val content = contentBuilder.toString()
-                            val updatedMessage = aiMessage.copy(content = content)
-                            // 防止后续读取不到
+                            // 只更新 aiMessage.content，不触发 chatHistory 更新
                             aiMessage.content = content
                             
-                            // 只有在非waifu模式下才显示流式更新
+                            // 只有在非waifu模式下才触发滚动事件
                             if (!isWaifuModeEnabled) {
-                                if (chatId != null) {
-                                    addMessageToChat(chatId, updatedMessage)
-                                }
                                 _scrollToBottomEvent.tryEmit(Unit)
                             }
                         }
