@@ -11,7 +11,7 @@ JavaScript 工具调用是一种功能强大的脚本机制，允许在 Android 
 - **结果返回**：使用 `complete()` 函数返回执行结果
 - **错误处理**：支持 JavaScript 标准的 try-catch 错误处理
 - **异步操作**：支持 Promise 和异步/等待模式
-- **Java/Kotlin 类桥接**：支持 `Java.type(...)` 直接调用 Java/Kotlin 类（Rhino 风格）
+- **Java/Kotlin 类桥接**：支持 `Java.xxx` 包链语法糖 + `Java.type(...)`（Rhino 风格）
 
 ## 使用指南
 
@@ -82,10 +82,11 @@ if (toolCall("default", "file_exists", { path: "/sdcard/my_file.txt" })) {
 
 #### 高层 API（推荐）
 
+- `Java.xxx`：包路径链式获取类代理（推荐）
 - `Java.type(className)`：获取类代理
 - `Java.use(className)` / `Java.importClass(className)`：`type` 的别名
 - `Java.package(packageName)`：获取包命名空间代理
-- `Java.implement(interfaceNameOrNames, impl)`：创建 Java 接口实现标记（支持 `string` 或 `string[]`）
+- `Java.implement(interfaceNameOrNames, impl)`：创建 Java 接口实现标记（支持 `string`、`string[]`、`Java.xxx` 类代理）
 - `Java.implement(impl)`：省略接口名，交给目标参数类型推断（适合入参本身就是 interface）
 - `Java.proxy(...)`：`implement(...)` 的别名
 - `Java.releaseJs(markerOrId)`：释放 `implement` 注册的 JS 回调对象
@@ -97,6 +98,8 @@ if (toolCall("default", "file_exists", { path: "/sdcard/my_file.txt" })) {
 
 `Kotlin` 是 `Java` 的同义别名，API 完全一致。
 另外还支持包路径链式访问：`Java.java.lang.System.currentTimeMillis()`。
+内部类也支持点语法：`Java.android.os.Build.VERSION`、`Java.android.app.AlertDialog.Builder`。
+如遇到大小写不一致的类名，也可使用精确类名写法：`Java.android.os["Build$VERSION"]`。
 
 #### 类代理（`Java.type(...)` 返回值）
 
@@ -119,19 +122,26 @@ if (toolCall("default", "file_exists", { path: "/sdcard/my_file.txt" })) {
 - `obj.someMethod(...)`：动态实例方法调用（语法糖）
 - `obj.someField` / `obj.someField = x`：动态字段访问（语法糖）
 
+#### 生命周期与释放（建议）
+
+- Java 对象跨桥接会以句柄形式持有，短生命周期对象建议在 `finally` 中显式 `release`。
+- `Java.implement(...)` / `Java.proxy(...)` 产生的回调标记建议用完后调用 `Java.releaseJs(...)`。
+- 运行时已接入自动回收（代理对象被 GC 后会尝试释放句柄），但 GC 时机不确定，仍建议关键路径显式释放。
+
 #### 接口实现代理（Java interface / implements）
 
 - `Java.implement("java.lang.Runnable", () => { ... })`：函数式实现（单方法接口最常见）
+- `Java.implement(Java.java.lang.Runnable, () => { ... })`：等价语法糖（类代理写法）
 - `Java.implement("com.xxx.Listener", { onStart(){}, onStop(){} })`：对象式实现（多方法）
-- `Java.implement(["a.InterfaceA", "b.InterfaceB"], impl)`：一次声明多接口（目标参数为 `Object` 时尤其有用）
+- `Java.implement(["a.InterfaceA", Java.b.InterfaceB], impl)`：一次声明多接口（目标参数为 `Object` 时尤其有用）
 - JS 里直接传函数参数给 Java（例如 `new Thread(() => {})`）也支持，会自动桥接为接口回调对象
 - 回调对象不再使用时请调用 `Java.releaseJs(markerOrId)` 释放，避免持有多余引用
 
 示例 1：`Runnable`
 
 ```javascript
-const Thread = Java.type("java.lang.Thread");
-const task = Java.implement("java.lang.Runnable", () => {
+const Thread = Java.java.lang.Thread;
+const task = Java.implement(Java.java.lang.Runnable, () => {
   console.log("run!");
 });
 new Thread(task).start();
@@ -221,12 +231,16 @@ complete({
 ```javascript
 const now = Java.java.lang.System.currentTimeMillis();
 const ArrayList = Java.java.util.ArrayList;
+const Version = Java.android.os.Build.VERSION;
+const AlertDialogBuilder = Java.android.app.AlertDialog.Builder;
 const list = new ArrayList();
 list.add("a");
 list.add("b");
 complete({
   now,
-  size: list.size()
+  size: list.size(),
+  sdkInt: Number(Version.SDK_INT),
+  dialogBuilderExists: !!AlertDialogBuilder
 });
 ```
 

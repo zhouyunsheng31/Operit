@@ -50,6 +50,7 @@ import com.ai.assistance.operit.data.model.AITool
 import com.ai.assistance.operit.data.model.ApiProviderType
 import com.ai.assistance.operit.data.model.AttachmentInfo
 import com.ai.assistance.operit.data.model.CharacterCardChatModelBindingMode
+import com.ai.assistance.operit.data.model.InputProcessingState
 import com.ai.assistance.operit.data.model.ToolParameter
 import com.ai.assistance.operit.data.preferences.ApiPreferences
 import com.ai.assistance.operit.data.preferences.UserPreferencesManager
@@ -58,6 +59,7 @@ import com.ai.assistance.operit.ui.features.chat.components.*
 import com.ai.assistance.operit.ui.features.chat.components.style.input.agent.AgentChatInputSection
 import com.ai.assistance.operit.ui.features.chat.components.style.input.classic.ClassicChatInputSection
 import com.ai.assistance.operit.ui.features.chat.components.style.input.classic.ClassicChatSettingsBar
+import com.ai.assistance.operit.ui.features.chat.components.style.input.common.PendingQueueMessageItem
 import com.ai.assistance.operit.ui.features.chat.components.AndroidExportDialog
 import com.ai.assistance.operit.ui.features.chat.components.ExportCompleteDialog
 import com.ai.assistance.operit.ui.features.chat.components.ExportPlatformDialog
@@ -212,6 +214,8 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
     val errorMessage by actualViewModel.errorMessage.collectAsState()
     // 按会话隔离的输入处理状态（用于进度条文案）
     val inputProcessingState by actualViewModel.currentChatInputProcessingState.collectAsState()
+    val isSummarizing by actualViewModel.isSummarizing.collectAsState()
+    val isSendTriggeredSummarizing by actualViewModel.isSendTriggeredSummarizing.collectAsState()
 
     val enableAiPlanning by actualViewModel.enableAiPlanning.collectAsState()
     val enableThinkingMode by actualViewModel.enableThinkingMode.collectAsState() // 收集思考模式状态
@@ -356,6 +360,68 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
     var autoScrollToBottom by remember { mutableStateOf(true) }
     val onAutoScrollToBottomChange = remember { { it: Boolean -> autoScrollToBottom = it } }
     val imeBottomPx = WindowInsets.ime.getBottom(density)
+    val isMessageProcessing =
+        isLoading ||
+            inputProcessingState is InputProcessingState.Connecting ||
+            inputProcessingState is InputProcessingState.ExecutingTool ||
+            inputProcessingState is InputProcessingState.ToolProgress ||
+            inputProcessingState is InputProcessingState.Processing ||
+            inputProcessingState is InputProcessingState.ProcessingToolResult ||
+            inputProcessingState is InputProcessingState.Summarizing ||
+            inputProcessingState is InputProcessingState.Receiving
+    val isQueueBlocked = isMessageProcessing || isSummarizing || isSendTriggeredSummarizing
+
+    val pendingQueueMessages = remember(currentChatId) { mutableStateListOf<PendingQueueMessageItem>() }
+    var isPendingQueueExpanded by remember(currentChatId) { mutableStateOf(true) }
+    var nextPendingQueueId by remember(currentChatId) { mutableStateOf(1L) }
+    var wasQueueBlocked by remember(currentChatId) { mutableStateOf(false) }
+    var suppressNextAutoDequeue by remember(currentChatId) { mutableStateOf(false) }
+    val latestQueueBlocked = rememberUpdatedState(isQueueBlocked)
+    val latestCurrentChatId = rememberUpdatedState(currentChatId)
+
+    val sendQueuedItemNow: (PendingQueueMessageItem, Boolean) -> Unit = { item, cancelCurrentConversation ->
+        coroutineScope.launch {
+            val shouldWaitForCancel = cancelCurrentConversation && latestQueueBlocked.value
+            if (shouldWaitForCancel) {
+                suppressNextAutoDequeue = true
+            }
+            if (cancelCurrentConversation) {
+                actualViewModel.cancelCurrentMessage()
+            }
+            if (shouldWaitForCancel) {
+                snapshotFlow { latestQueueBlocked.value }.first { !it }
+            }
+
+            val chatId = latestCurrentChatId.value
+            if (chatId.isNullOrBlank()) {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.chat_please_create_new_chat),
+                    Toast.LENGTH_SHORT
+                ).show()
+                return@launch
+            }
+
+            focusManager.clearFocus()
+            actualViewModel.sendTextMessage(item.text)
+            autoScrollToBottom = true
+        }
+    }
+
+    LaunchedEffect(isQueueBlocked, pendingQueueMessages.size, currentChatId) {
+        if (wasQueueBlocked && !isQueueBlocked) {
+            if (suppressNextAutoDequeue) {
+                suppressNextAutoDequeue = false
+            } else if (pendingQueueMessages.isNotEmpty()) {
+                delay(250)
+                if (!latestQueueBlocked.value && pendingQueueMessages.isNotEmpty()) {
+                    val nextMessage = pendingQueueMessages.removeAt(0)
+                    sendQueuedItemNow(nextMessage, false)
+                }
+            }
+        }
+        wasQueueBlocked = isQueueBlocked
+    }
 
     // 处理来自ViewModel的滚动事件（流式输出时）
     LaunchedEffect(Unit) {
@@ -557,6 +623,29 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
         hasBackgroundImage -> colorScheme.surface.copy(alpha = 0.85f)
         else -> colorScheme.surface
     }
+
+    fun removePendingQueueMessageById(id: Long): PendingQueueMessageItem? {
+        val index = pendingQueueMessages.indexOfFirst { it.id == id }
+        if (index < 0) return null
+        return pendingQueueMessages.removeAt(index)
+    }
+
+    fun enqueueDraftToPendingQueue() {
+        val draftText = userMessage.text.trim()
+        if (draftText.isBlank()) return
+
+        pendingQueueMessages.add(
+            PendingQueueMessageItem(
+                id = nextPendingQueueId,
+                text = draftText
+            )
+        )
+        nextPendingQueueId += 1
+        isPendingQueueExpanded = true
+        actualViewModel.updateUserMessage(TextFieldValue(""))
+        actualViewModel.showToast(context.getString(R.string.chat_queue_added))
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         CustomScaffold(
                 containerColor = Color.Transparent,
@@ -593,7 +682,11 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
                                                 autoScrollToBottom = true
                                             }
                                         },
-                                        onCancelMessage = { actualViewModel.cancelCurrentMessage() },
+                                        onQueueMessage = { enqueueDraftToPendingQueue() },
+                                        onCancelMessage = {
+                                            pendingQueueMessages.clear()
+                                            actualViewModel.cancelCurrentMessage()
+                                        },
                                         isLoading = isLoading,
                                         inputState = inputProcessingState,
                                         allowTextInputWhileProcessing = true,
@@ -680,6 +773,28 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
                                         onNavigateToModelConfig = onNavigateToModelConfig,
                                         characterCardBoundChatModelConfigId = characterCardBoundChatModelConfigId,
                                         characterCardBoundChatModelIndex = characterCardBoundChatModelIndex,
+                                        pendingQueueMessages = pendingQueueMessages,
+                                        isPendingQueueExpanded = isPendingQueueExpanded,
+                                        onPendingQueueExpandedChange = { isPendingQueueExpanded = it },
+                                        onDeletePendingQueueMessage = { id ->
+                                            removePendingQueueMessageById(id)
+                                        },
+                                        onEditPendingQueueMessage = { id ->
+                                            removePendingQueueMessageById(id)?.let { queueItem ->
+                                                val text = queueItem.text
+                                                actualViewModel.updateUserMessage(
+                                                    TextFieldValue(
+                                                        text = text,
+                                                        selection = TextRange(text.length)
+                                                    )
+                                                )
+                                            }
+                                        },
+                                        onSendPendingQueueMessage = { id ->
+                                            removePendingQueueMessageById(id)?.let { queueItem ->
+                                                sendQueuedItemNow(queueItem, true)
+                                            }
+                                        },
                                 )
                             } else {
                                 ClassicChatInputSection(
@@ -704,7 +819,11 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
                                                 autoScrollToBottom = true
                                             }
                                         },
-                                        onCancelMessage = { actualViewModel.cancelCurrentMessage() },
+                                        onQueueMessage = { enqueueDraftToPendingQueue() },
+                                        onCancelMessage = {
+                                            pendingQueueMessages.clear()
+                                            actualViewModel.cancelCurrentMessage()
+                                        },
                                         isLoading = isLoading,
                                         inputState = inputProcessingState,
                                         allowTextInputWhileProcessing = true,
@@ -741,7 +860,29 @@ val actualViewModel: ChatViewModel = viewModel ?: viewModel { ChatViewModel(cont
                                         onClearReply = {
                                             actualViewModel.clearReplyToMessage()
                                         },
-                                        isWorkspaceOpen = isWorkspaceOpen
+                                        isWorkspaceOpen = isWorkspaceOpen,
+                                        pendingQueueMessages = pendingQueueMessages,
+                                        isPendingQueueExpanded = isPendingQueueExpanded,
+                                        onPendingQueueExpandedChange = { isPendingQueueExpanded = it },
+                                        onDeletePendingQueueMessage = { id ->
+                                            removePendingQueueMessageById(id)
+                                        },
+                                        onEditPendingQueueMessage = { id ->
+                                            removePendingQueueMessageById(id)?.let { queueItem ->
+                                                val text = queueItem.text
+                                                actualViewModel.updateUserMessage(
+                                                    TextFieldValue(
+                                                        text = text,
+                                                        selection = TextRange(text.length)
+                                                    )
+                                                )
+                                            }
+                                        },
+                                        onSendPendingQueueMessage = { id ->
+                                            removePendingQueueMessageById(id)?.let { queueItem ->
+                                                sendQueuedItemNow(queueItem, true)
+                                            }
+                                        }
                                 )
                             }
                         }

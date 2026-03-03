@@ -66,9 +66,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -129,6 +127,8 @@ import com.ai.assistance.operit.ui.features.chat.components.AttachmentChip
 import com.ai.assistance.operit.ui.features.chat.components.AttachmentSelectorPopupPanel
 import com.ai.assistance.operit.ui.features.chat.components.FullscreenInputDialog
 import com.ai.assistance.operit.ui.features.chat.components.style.input.common.CharacterCardModelBindingSwitchConfirmDialog
+import com.ai.assistance.operit.ui.features.chat.components.style.input.common.PendingMessageQueuePanel
+import com.ai.assistance.operit.ui.features.chat.components.style.input.common.PendingQueueMessageItem
 import com.ai.assistance.operit.ui.features.chat.components.style.input.common.ToolPromptManagerDialog
 import com.ai.assistance.operit.ui.features.chat.viewmodel.ChatViewModel
 import com.ai.assistance.operit.ui.floating.FloatingMode
@@ -143,6 +143,7 @@ fun AgentChatInputSection(
     userMessage: TextFieldValue,
     onUserMessageChange: (TextFieldValue) -> Unit,
     onSendMessage: () -> Unit,
+    onQueueMessage: () -> Unit,
     onCancelMessage: () -> Unit,
     isLoading: Boolean,
     inputState: InputProcessingState = InputProcessingState.Idle,
@@ -195,13 +196,18 @@ fun AgentChatInputSection(
     onNavigateToModelConfig: () -> Unit = {},
     characterCardBoundChatModelConfigId: String? = null,
     characterCardBoundChatModelIndex: Int = 0,
+    pendingQueueMessages: List<PendingQueueMessageItem> = emptyList(),
+    isPendingQueueExpanded: Boolean = true,
+    onPendingQueueExpandedChange: (Boolean) -> Unit = {},
+    onDeletePendingQueueMessage: (Long) -> Unit = {},
+    onEditPendingQueueMessage: (Long) -> Unit = {},
+    onSendPendingQueueMessage: (Long) -> Unit = {},
 ) {
     val showTokenLimitDialog = remember { mutableStateOf(false) }
     val showFullscreenInput = remember { mutableStateOf(false) }
     val showModelSelectorPopup = remember { mutableStateOf(false) }
     val showExtraSettingsPopup = remember { mutableStateOf(false) }
     var showCharacterCardBindingSwitchConfirm by remember { mutableStateOf(false) }
-    var pendingInterruptSend by remember { mutableStateOf(false) }
     var pendingCharacterCardModelSelection by remember { mutableStateOf<Pair<String, Int>?>(null) }
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -219,13 +225,10 @@ fun AgentChatInputSection(
             inputState is InputProcessingState.ProcessingToolResult ||
             inputState is InputProcessingState.Summarizing ||
             inputState is InputProcessingState.Receiving
-    val isProcessingState = rememberUpdatedState(isProcessing)
-
     if (showTokenLimitDialog.value) {
         AlertDialog(
             onDismissRequest = {
                 showTokenLimitDialog.value = false
-                pendingInterruptSend = false
             },
             title = { Text(context.getString(R.string.token_limit_warning)) },
             text = { Text(context.getString(R.string.token_limit_warning_message)) },
@@ -233,19 +236,7 @@ fun AgentChatInputSection(
                 TextButton(
                     onClick = {
                         showTokenLimitDialog.value = false
-                        val shouldInterrupt = pendingInterruptSend
-                        pendingInterruptSend = false
-                        if (shouldInterrupt) {
-                            scope.launch {
-                                if (isProcessingState.value) {
-                                    onCancelMessage()
-                                    snapshotFlow { isProcessingState.value }.first { !it }
-                                }
-                                onSendMessage()
-                            }
-                        } else {
-                            onSendMessage()
-                        }
+                        onSendMessage()
                     },
                 ) { Text(context.getString(R.string.continue_send)) }
             },
@@ -253,7 +244,6 @@ fun AgentChatInputSection(
                 TextButton(
                     onClick = {
                         showTokenLimitDialog.value = false
-                        pendingInterruptSend = false
                     },
                 ) {
                     Text(context.getString(R.string.cancel))
@@ -360,9 +350,10 @@ fun AgentChatInputSection(
             false
         }
 
-    val canSendMessage = userMessage.text.isNotBlank() || attachments.isNotEmpty()
-    val canInterruptSend = isProcessing && canSendMessage
-    val showCancelAction = isProcessing && !canSendMessage
+    val hasDraftText = userMessage.text.isNotBlank()
+    val canSendMessage = hasDraftText || attachments.isNotEmpty()
+    val showQueueAction = isProcessing && hasDraftText
+    val showCancelAction = isProcessing && !showQueueAction
     val sendButtonEnabled = true
 
     val voicePermissionLauncher =
@@ -408,6 +399,17 @@ fun AgentChatInputSection(
             isDarkTheme && chatInputTransparent -> darkModeInputColor
             isDarkTheme -> inputContainerColor
             else -> MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+        }
+    val queueContainerColor =
+        when {
+            chatInputTransparent -> MaterialTheme.colorScheme.surface.copy(alpha = 0.72f)
+            else -> inputContainerColor
+        }
+    val queueItemColor =
+        when {
+            chatInputTransparent -> MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+            isDarkTheme -> MaterialTheme.colorScheme.surface.copy(alpha = 0.92f)
+            else -> MaterialTheme.colorScheme.surface
         }
     val modelLabel =
         if (displayModelName.isBlank()) {
@@ -574,6 +576,18 @@ fun AgentChatInputSection(
                     }
                 }
             }
+
+            PendingMessageQueuePanel(
+                queuedMessages = pendingQueueMessages,
+                expanded = isPendingQueueExpanded,
+                onExpandedChange = onPendingQueueExpandedChange,
+                onDeleteMessage = onDeletePendingQueueMessage,
+                onEditMessage = onEditPendingQueueMessage,
+                onSendMessage = onSendPendingQueueMessage,
+                containerColor = queueContainerColor,
+                itemColor = queueItemColor,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+            )
 
             SimpleAnimatedVisibility(
                 visible = showProcessingStatus,
@@ -800,6 +814,7 @@ fun AgentChatInputSection(
                         val actionButtonBackground =
                             when {
                                 showCancelAction -> MaterialTheme.colorScheme.error
+                                showQueueAction -> MaterialTheme.colorScheme.tertiary
                                 canSendMessage ->
                                     if (isOverTokenLimit) {
                                         MaterialTheme.colorScheme.secondary
@@ -812,6 +827,7 @@ fun AgentChatInputSection(
                         val actionButtonIconTint =
                             when {
                                 showCancelAction -> MaterialTheme.colorScheme.onError
+                                showQueueAction -> MaterialTheme.colorScheme.onTertiary
                                 canSendMessage ->
                                     if (isOverTokenLimit) {
                                         MaterialTheme.colorScheme.onSecondary
@@ -845,26 +861,16 @@ fun AgentChatInputSection(
                                             onClick = {
                                                 when {
                                                     showCancelAction -> onCancelMessage()
+                                                    showQueueAction -> {
+                                                        onQueueMessage()
+                                                        setShowAttachmentPanel(false)
+                                                    }
                                                     canSendMessage -> {
                                                         if (isOverTokenLimit) {
-                                                            pendingInterruptSend = canInterruptSend
                                                             showTokenLimitDialog.value = true
                                                         } else {
-                                                            pendingInterruptSend = false
-                                                            if (canInterruptSend) {
-                                                                scope.launch {
-                                                                    if (isProcessingState.value) {
-                                                                        onCancelMessage()
-                                                                        snapshotFlow { isProcessingState.value }
-                                                                            .first { !it }
-                                                                    }
-                                                                    onSendMessage()
-                                                                    setShowAttachmentPanel(false)
-                                                                }
-                                                            } else {
-                                                                onSendMessage()
-                                                                setShowAttachmentPanel(false)
-                                                            }
+                                                            onSendMessage()
+                                                            setShowAttachmentPanel(false)
                                                         }
                                                     }
                                                     else -> {
@@ -884,12 +890,14 @@ fun AgentChatInputSection(
                                     imageVector =
                                         when {
                                             showCancelAction -> Icons.Default.Close
+                                            showQueueAction -> Icons.Default.Add
                                             canSendMessage -> Icons.AutoMirrored.Filled.Send
                                             else -> Icons.Default.Mic
                                         },
                                     contentDescription =
                                         when {
                                             showCancelAction -> context.getString(R.string.cancel)
+                                            showQueueAction -> context.getString(R.string.chat_queue_add_message)
                                             canSendMessage -> context.getString(R.string.send)
                                             else -> context.getString(R.string.voice_input)
                                         },
@@ -1074,6 +1082,7 @@ fun AgentChatInputSection(
                             val actionButtonBackground =
                                 when {
                                     showCancelAction -> MaterialTheme.colorScheme.error
+                                    showQueueAction -> MaterialTheme.colorScheme.tertiary
                                     canSendMessage ->
                                         if (isOverTokenLimit) {
                                             MaterialTheme.colorScheme.secondary
@@ -1086,6 +1095,7 @@ fun AgentChatInputSection(
                             val actionButtonIconTint =
                                 when {
                                     showCancelAction -> MaterialTheme.colorScheme.onError
+                                    showQueueAction -> MaterialTheme.colorScheme.onTertiary
                                     canSendMessage ->
                                         if (isOverTokenLimit) {
                                             MaterialTheme.colorScheme.onSecondary
@@ -1119,26 +1129,16 @@ fun AgentChatInputSection(
                                                 onClick = {
                                                     when {
                                                         showCancelAction -> onCancelMessage()
+                                                        showQueueAction -> {
+                                                            onQueueMessage()
+                                                            setShowAttachmentPanel(false)
+                                                        }
                                                         canSendMessage -> {
                                                             if (isOverTokenLimit) {
-                                                                pendingInterruptSend = canInterruptSend
                                                                 showTokenLimitDialog.value = true
                                                             } else {
-                                                                pendingInterruptSend = false
-                                                                if (canInterruptSend) {
-                                                                    scope.launch {
-                                                                        if (isProcessingState.value) {
-                                                                            onCancelMessage()
-                                                                            snapshotFlow { isProcessingState.value }
-                                                                                .first { !it }
-                                                                        }
-                                                                        onSendMessage()
-                                                                        setShowAttachmentPanel(false)
-                                                                    }
-                                                                } else {
-                                                                    onSendMessage()
-                                                                    setShowAttachmentPanel(false)
-                                                                }
+                                                                onSendMessage()
+                                                                setShowAttachmentPanel(false)
                                                             }
                                                         }
                                                         else -> {
@@ -1158,12 +1158,14 @@ fun AgentChatInputSection(
                                         imageVector =
                                             when {
                                                 showCancelAction -> Icons.Default.Close
+                                                showQueueAction -> Icons.Default.Add
                                                 canSendMessage -> Icons.AutoMirrored.Filled.Send
                                                 else -> Icons.Default.Mic
                                             },
                                         contentDescription =
                                             when {
                                                 showCancelAction -> context.getString(R.string.cancel)
+                                                showQueueAction -> context.getString(R.string.chat_queue_add_message)
                                                 canSendMessage -> context.getString(R.string.send)
                                                 else -> context.getString(R.string.voice_input)
                                             },
@@ -1231,7 +1233,7 @@ fun AgentChatInputSection(
                 onDismiss = { showExtraSettingsPopup.value = false },
             )
 
-            if (isOverTokenLimit && canSendMessage) {
+            if (isOverTokenLimit && canSendMessage && !showQueueAction) {
                 Text(
                     text =
                         context.getString(

@@ -512,6 +512,98 @@ const pageInfo = await Tools.UI.getPageInfo();
 await Tools.UI.swipe(540, 1800, 540, 900);
 ```
 
+### 3.4. Java/Kotlin 类桥接 (Java Bridge)
+
+除了 `Tools` 外，脚本运行时还注入了 `Java` / `Kotlin` 全局对象，用于直接调用 Java/Kotlin/Android 类。
+
+这套能力适用于：
+
+-   直接访问 Android SDK 类（如 `android.os.Build`、`android.os.SystemClock`）。
+-   调用宿主应用暴露的类与单例对象。
+-   在脚本中实现 Java 接口回调（如 `Runnable`、`Callable`、Listener）。
+
+#### 3.4.1. 两层 API
+
+1.  **高层 API（推荐）**：`Java` / `Kotlin`（Rhino 风格）
+2.  **底层 API（调试/底层控制）**：`NativeInterface.java*`
+
+`Kotlin` 是 `Java` 的同义别名，API 完全一致。
+
+#### 3.4.2. 高层 API 常用能力
+
+-   类获取：
+    -   语法糖（推荐）：`Java.java.lang.StringBuilder`、`Java.android.os.Build.VERSION`、`Java.android.app.AlertDialog.Builder`
+    -   兼容写法：`Java.type("java.lang.StringBuilder")`
+    -   别名：`Java.use(...)` / `Java.importClass(...)`
+-   包链访问：`Java.java.lang.System.currentTimeMillis()`
+-   静态调用：`Java.callStatic(className, methodName, ...args)`
+-   构造实例：`Java.newInstance(className, ...args)` 或 `new Java.java.util.ArrayList()`
+-   接口实现：
+    -   `Java.implement(interfaceNameOrNames, impl)`（支持字符串接口名或 `Java.xxx` 类代理）
+    -   `Java.proxy(interfaceNameOrNames, impl)`（`implement` 别名）
+-   生命周期管理：
+    -   `obj.release()` / `Java.release(instanceOrHandle)`
+    -   `Java.releaseAll()`
+    -   `Java.releaseJs(markerOrId)`（释放 `implement/proxy` 注册的 JS 回调对象）
+
+#### 3.4.3. 句柄与释放建议
+
+Java 复杂对象跨桥接会被包装成“实例代理”（内部是 handle 句柄），建议：
+
+-   对短生命周期对象，在 `finally` 中显式 `release`。
+-   对 `Java.implement` / `Java.proxy` 产生的回调标记，完成后调用 `Java.releaseJs(...)`。
+-   运行时已接入自动回收（代理对象被 GC 后会尝试释放对应句柄），但 GC 时机不确定，**不要只依赖自动回收**。
+
+#### 3.4.4. 示例：包链语法 + 回调 + 释放
+
+```typescript
+const Thread = Java.java.lang.Thread;
+const Runnable = Java.java.lang.Runnable;
+
+let runCount = 0;
+const runnable = Java.implement(Runnable, () => {
+    runCount += 1;
+});
+
+const worker = new Thread(runnable);
+try {
+    worker.start();
+    worker.join(2000);
+    console.log("runCount=", runCount);
+} finally {
+    worker.release();
+    Java.releaseJs(runnable);
+}
+```
+
+#### 3.4.5. 示例：Android 类与内部类
+
+```typescript
+const Build = Java.android.os.Build;
+const Version = Java.android.os.Build.VERSION;
+const AlertDialogBuilder = Java.android.app.AlertDialog.Builder;
+
+console.log("brand=", String(Build.BRAND || ""));
+console.log("sdk=", Number(Version.SDK_INT));
+```
+
+#### 3.4.6. 底层 `NativeInterface.java*`（仅在必要时使用）
+
+高层 API 会自动处理参数转换、异常抛出与句柄包装。只有在调试底层行为时才建议直接使用 `NativeInterface.java*`：
+
+```typescript
+const raw = NativeInterface.javaCallStatic(
+    "java.lang.Integer",
+    "parseInt",
+    JSON.stringify(["42"])
+);
+const parsed = JSON.parse(raw);
+if (!parsed.success) throw new Error(parsed.error);
+console.log(parsed.data); // 42
+```
+
+如果你在 TypeScript 中开发，建议先引用 `examples/types/index.d.ts`，即可获得 Java Bridge 的类型提示（含 `Java`、`Kotlin`、`NativeInterface`）。
+
 ## 4. 编写第一个脚本 (TypeScript)
 
 推荐使用 TypeScript 来编写脚本，这样可以充分利用 `types/` 目录中提供的类型定义，获得更好的开发体验。

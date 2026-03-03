@@ -14,7 +14,10 @@ import {
     JavaBridgeHandle as JavaBridgeHandleType,
     JavaBridgePackage as JavaBridgePackageType,
     JavaBridgeJsInterfaceMarker as JavaBridgeJsInterfaceMarkerType,
-    JavaBridgeJsInterfaceImpl as JavaBridgeJsInterfaceImplType
+    JavaBridgeJsInterfaceImpl as JavaBridgeJsInterfaceImplType,
+    JavaBridgeJsMethod as JavaBridgeJsMethodType,
+    JavaBridgeInterfaceRef as JavaBridgeInterfaceRefType,
+    JavaBridgeCallbackResult as JavaBridgeCallbackResultType
 } from './java-bridge';
 import {
     CalculationResultData as _CalculationResultData,
@@ -136,6 +139,9 @@ declare global {
     type JavaBridgePackage = JavaBridgePackageType;
     type JavaBridgeJsInterfaceMarker = JavaBridgeJsInterfaceMarkerType;
     type JavaBridgeJsInterfaceImpl = JavaBridgeJsInterfaceImplType;
+    type JavaBridgeJsMethod = JavaBridgeJsMethodType;
+    type JavaBridgeInterfaceRef = JavaBridgeInterfaceRefType;
+    type JavaBridgeCallbackResult = JavaBridgeCallbackResultType;
 
 
     // Make result types available globally

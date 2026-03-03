@@ -1,16 +1,38 @@
 #!/bin/bash
 
 # Check parameters
-if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <JS_file_path> <function_name> [parameters_JSON]"
-    echo "Example: $0 ./example.js hello_world '{\"name\":\"John\"}'"
+if [ -z "${1:-}" ]; then
+    echo "Usage: $0 <JS_file_path> [function_name] [parameters_JSON] [env_file_path]"
+    echo "Example: $0 example.js"
+    echo "Example: $0 example.js main"
+    echo "Example: $0 example.js main '{\"name\":\"John\"}'"
+    echo "Example: $0 example.js main '{}' .env.local"
+    echo "Note: set OPERIT_LOG_WAIT_SECONDS to customize log wait, default is 6 seconds"
     exit 1
 fi
 
 # Parameters
 FILE_PATH="$1"
-FUNCTION_NAME="$2"
-PARAMS="${3:-{}}"  # Default to empty object
+if [ -z "${2:-}" ]; then
+    FUNCTION_NAME="main"
+    PARAMS="{}"
+    ENV_FILE_PATH=""
+else
+    FUNCTION_NAME="$2"
+    if [ -z "${3:-}" ]; then
+        PARAMS="{}"
+        ENV_FILE_PATH="${4:-}"
+    else
+        PARAMS="$3"
+        ENV_FILE_PATH="${4:-}"
+    fi
+fi
+
+if [ -z "${OPERIT_LOG_WAIT_SECONDS:-}" ]; then
+    LOG_WAIT_SECONDS=6
+else
+    LOG_WAIT_SECONDS="$OPERIT_LOG_WAIT_SECONDS"
+fi
 
 # Check if file exists
 if [ ! -f "$FILE_PATH" ]; then
@@ -18,87 +40,104 @@ if [ ! -f "$FILE_PATH" ]; then
     exit 1
 fi
 
-# Check if ADB is available
-if ! command -v adb &> /dev/null; then
-    echo "Error: ADB command not found. Make sure Android SDK is installed and adb is in PATH"
+# Check ADB availability
+if ! command -v adb >/dev/null 2>&1; then
+    echo "Error: ADB command not found."
+    echo "Make sure Android SDK is installed and adb is in PATH"
     exit 1
 fi
 
-# Check for connected devices and handle device selection
+# Device detection
 echo "Checking connected devices..."
-# Filter to include only lines ending with "device" (fully connected devices)
-DEVICE_LIST=($(adb devices | grep -v "List" | grep "device$" | awk '{print $1}'))
+mapfile -t DEVICE_LIST < <(adb devices | awk 'NR>1 && $2=="device" {print $1}')
 DEVICE_COUNT=${#DEVICE_LIST[@]}
 
-if [ $DEVICE_COUNT -eq 0 ]; then
-    echo "Error: No Android devices detected"
+if [ "$DEVICE_COUNT" -eq 0 ]; then
+    echo "Error: No authorized devices found"
     exit 1
 fi
 
-# Handle device selection
-if [ $DEVICE_COUNT -eq 1 ]; then
-    DEVICE_SERIAL=${DEVICE_LIST[0]}
+# Device selection
+if [ "$DEVICE_COUNT" -eq 1 ]; then
+    DEVICE_SERIAL="${DEVICE_LIST[0]}"
     echo "Using the only connected device: $DEVICE_SERIAL"
 else
-    echo "Multiple devices detected. Please select a device:"
-    for i in $(seq 0 $((DEVICE_COUNT-1))); do
-        echo "$((i+1)): ${DEVICE_LIST[$i]}"
+    while true; do
+        echo "Multiple devices detected:"
+        for ((i = 0; i < DEVICE_COUNT; i += 1)); do
+            echo "  $((i + 1)). ${DEVICE_LIST[$i]}"
+        done
+        read -r -p "Select device (1-$DEVICE_COUNT): " CHOICE
+
+        if ! [[ "$CHOICE" =~ ^[0-9]+$ ]]; then
+            echo "Invalid input. Numbers only."
+            continue
+        fi
+        if [ "$CHOICE" -lt 1 ]; then
+            echo "Number too small"
+            continue
+        fi
+        if [ "$CHOICE" -gt "$DEVICE_COUNT" ]; then
+            echo "Number too large"
+            continue
+        fi
+
+        DEVICE_SERIAL="${DEVICE_LIST[$((CHOICE - 1))]}"
+        echo "Selected device: $DEVICE_SERIAL"
+        break
     done
-    
-    echo -n "Enter device number (1-$DEVICE_COUNT): "
-    read SELECTION
-    
-    # Validate selection
-    if ! [[ "$SELECTION" =~ ^[0-9]+$ ]] || [ $SELECTION -lt 1 ] || [ $SELECTION -gt $DEVICE_COUNT ]; then
-        echo "Error: Invalid selection"
-        exit 1
-    fi
-    
-    # Array is 0-indexed but user selection is 1-indexed
-    DEVICE_SERIAL=${DEVICE_LIST[$((SELECTION-1))]}
-    echo "Using selected device: $DEVICE_SERIAL"
 fi
 
-# Create target directory
+# File operations
+echo "Creating directory structure..."
 TARGET_DIR="/sdcard/Android/data/com.ai.assistance.operit/js_temp"
-echo "Creating directory on device..."
-adb -s "$DEVICE_SERIAL" shell "mkdir -p $TARGET_DIR" 2>/dev/null
+adb -s "$DEVICE_SERIAL" shell mkdir -p "$TARGET_DIR"
+TARGET_FILE="$TARGET_DIR/$(basename "$FILE_PATH")"
 
-# Check if directory creation succeeded, try alternative methods if not
-if [ $? -ne 0 ]; then
-    echo "Standard mkdir failed, trying alternative method..."
-    adb -s "$DEVICE_SERIAL" shell "mkdir /sdcard/Android/data/com.ai.assistance.operit" 2>/dev/null
-    adb -s "$DEVICE_SERIAL" shell "mkdir /sdcard/Android/data/com.ai.assistance.operit/js_temp" 2>/dev/null
-fi
-
-# Get file name and target path
-FILE_NAME=$(basename "$FILE_PATH")
-TARGET_FILE="$TARGET_DIR/$FILE_NAME"
-
-# Push file to device
-echo "Pushing $FILE_PATH to device $DEVICE_SERIAL..."
+echo "Pushing [$FILE_PATH] to device..."
 adb -s "$DEVICE_SERIAL" push "$FILE_PATH" "$TARGET_FILE"
-
 if [ $? -ne 0 ]; then
     echo "Error: Failed to push file"
     exit 1
 fi
 
-# Escape JSON parameters 
-ESCAPED_PARAMS=$(echo "$PARAMS" | sed 's/"/\\"/g')
+# Resolve env file path
+if [ -z "$ENV_FILE_PATH" ]; then
+    SCRIPT_DIR="$(dirname "$FILE_PATH")"
+    if [ -f "$SCRIPT_DIR/.env.local" ]; then
+        ENV_FILE_PATH="$SCRIPT_DIR/.env.local"
+    fi
+fi
 
-# Send broadcast to execute script
-echo "Executing function $FUNCTION_NAME on device $DEVICE_SERIAL..."
-adb -s "$DEVICE_SERIAL" shell am broadcast -a com.ai.assistance.operit.EXECUTE_JS \
-    -n com.ai.assistance.operit/.tools.javascript.ScriptExecutionReceiver \
-    --include-stopped-packages \
-    --es file_path "$TARGET_FILE" \
-    --es function_name "$FUNCTION_NAME" \
-    --es params "$ESCAPED_PARAMS" \
-    --ez temp_file true
+TARGET_ENV_FILE=""
+HAS_ENV_FILE=false
+if [ -n "$ENV_FILE_PATH" ] && [ -f "$ENV_FILE_PATH" ]; then
+    TARGET_ENV_FILE="$TARGET_DIR/$(basename "$ENV_FILE_PATH")"
+    echo "Pushing env file [$ENV_FILE_PATH] to device..."
+    adb -s "$DEVICE_SERIAL" push "$ENV_FILE_PATH" "$TARGET_ENV_FILE"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to push env file"
+        exit 1
+    fi
+    HAS_ENV_FILE=true
+fi
 
-echo "Waiting for execution to complete..."
-sleep 2
+# Escape JSON quotes
+ESCAPED_PARAMS="${PARAMS//\"/\\\"}"
 
-echo "Capturing logcat output for JsEngine tag (Press Ctrl+C to stop):"
-adb -s "$DEVICE_SERIAL" logcat -s JsEngine:* 
+# Reset logcat buffer to avoid old logs
+adb -s "$DEVICE_SERIAL" logcat -c
+
+# Execute JS function
+echo "Executing [$FUNCTION_NAME] with params: $ESCAPED_PARAMS"
+if [ "$HAS_ENV_FILE" = "true" ]; then
+    adb -s "$DEVICE_SERIAL" shell "am broadcast -a com.ai.assistance.operit.EXECUTE_JS -n com.ai.assistance.operit/.core.tools.javascript.ScriptExecutionReceiver --include-stopped-packages --es file_path '$TARGET_FILE' --es function_name '$FUNCTION_NAME' --es params '$ESCAPED_PARAMS' --es env_file_path '$TARGET_ENV_FILE' --ez temp_file true --ez temp_env_file true"
+else
+    adb -s "$DEVICE_SERIAL" shell "am broadcast -a com.ai.assistance.operit.EXECUTE_JS -n com.ai.assistance.operit/.core.tools.javascript.ScriptExecutionReceiver --include-stopped-packages --es file_path '$TARGET_FILE' --es function_name '$FUNCTION_NAME' --es params '$ESCAPED_PARAMS' --ez temp_file true"
+fi
+
+echo "Waiting ${LOG_WAIT_SECONDS}s for execution and logs..."
+sleep "$LOG_WAIT_SECONDS"
+
+echo "Capturing logcat output and exiting..."
+adb -s "$DEVICE_SERIAL" logcat -d -s ScriptExecutionReceiver:* JsEngine:*

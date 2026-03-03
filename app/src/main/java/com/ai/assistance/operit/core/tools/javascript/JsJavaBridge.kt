@@ -28,6 +28,10 @@ internal fun buildJavaClassBridgeDefinition(): String {
 
             var __javaBridgeJsObjectStore = Object.create(null);
             var __javaBridgeJsObjectCounter = 0;
+            var __javaHandleRegistrations = new Map();
+            var __javaInstanceFinalizer = new FinalizationRegistry(function(heldValue) {
+                finalizeInstanceProxy(heldValue);
+            });
 
             function registerJsObject(value) {
                 __javaBridgeJsObjectCounter += 1;
@@ -48,15 +52,179 @@ internal fun buildJavaClassBridgeDefinition(): String {
                 return false;
             }
 
+            function normalizeHandleValue(value) {
+                return String(value || '').trim();
+            }
+
+            function registerInstanceProxy(handle, proxyObject) {
+                var normalized = normalizeHandleValue(handle);
+                if (!normalized || !proxyObject || typeof proxyObject !== 'object') {
+                    return;
+                }
+
+                var token = {};
+                var tokenSet = __javaHandleRegistrations.get(normalized);
+                if (!tokenSet) {
+                    tokenSet = new Set();
+                    __javaHandleRegistrations.set(normalized, tokenSet);
+                }
+                tokenSet.add(token);
+
+                __javaInstanceFinalizer.register(
+                    proxyObject,
+                    {
+                        handle: normalized,
+                        token: token
+                    },
+                    token
+                );
+            }
+
+            function clearInstanceHandleRegistrations(handle) {
+                var normalized = normalizeHandleValue(handle);
+                if (!normalized) {
+                    return;
+                }
+
+                var tokenSet = __javaHandleRegistrations.get(normalized);
+                if (!tokenSet) {
+                    return;
+                }
+
+                tokenSet.forEach(function(token) {
+                    __javaInstanceFinalizer.unregister(token);
+                });
+                __javaHandleRegistrations.delete(normalized);
+            }
+
+            function releaseInstanceHandle(handle, ignoreErrors) {
+                var normalized = normalizeHandleValue(handle);
+                if (!normalized) {
+                    return false;
+                }
+
+                try {
+                    var released = !!invokeBridge('javaReleaseInstance', [normalized]);
+                    clearInstanceHandleRegistrations(normalized);
+                    return released;
+                } catch (error) {
+                    if (ignoreErrors) {
+                        clearInstanceHandleRegistrations(normalized);
+                        return false;
+                    }
+                    throw error;
+                }
+            }
+
+            function finalizeInstanceProxy(heldValue) {
+                if (!heldValue || typeof heldValue !== 'object') {
+                    return;
+                }
+
+                var normalized = normalizeHandleValue(heldValue.handle);
+                if (!normalized) {
+                    return;
+                }
+
+                var tokenSet = __javaHandleRegistrations.get(normalized);
+                if (!tokenSet) {
+                    return;
+                }
+
+                tokenSet.delete(heldValue.token);
+                if (tokenSet.size > 0) {
+                    return;
+                }
+
+                __javaHandleRegistrations.delete(normalized);
+                releaseInstanceHandle(normalized, true);
+            }
+
+            function releaseAllInstanceHandles() {
+                __javaHandleRegistrations.forEach(function(tokenSet) {
+                    tokenSet.forEach(function(token) {
+                        __javaInstanceFinalizer.unregister(token);
+                    });
+                });
+                __javaHandleRegistrations.clear();
+                return invokeBridge('javaReleaseAllInstances', []);
+            }
+
+            function normalizeInterfaceName(value) {
+                if (value === null || value === undefined) {
+                    return '';
+                }
+
+                if (typeof value === 'function' || typeof value === 'object') {
+                    try {
+                        if (
+                            Object.prototype.hasOwnProperty.call(value, 'className') &&
+                            typeof value.className === 'string'
+                        ) {
+                            var classNameValue = String(value.className || '').trim();
+                            if (classNameValue) {
+                                return classNameValue;
+                            }
+                        }
+                    } catch (_error) {
+                    }
+
+                    try {
+                        if (
+                            Object.prototype.hasOwnProperty.call(value, '__javaClass') &&
+                            typeof value.__javaClass === 'string'
+                        ) {
+                            var javaClassValue = String(value.__javaClass || '').trim();
+                            if (javaClassValue) {
+                                return javaClassValue;
+                            }
+                        }
+                    } catch (_error2) {
+                    }
+                }
+
+                if (typeof value === 'function' || typeof value === 'object') {
+                    return '';
+                }
+                return String(value || '').trim();
+            }
+
+            function isJavaClassReference(value) {
+                if (!value || (typeof value !== 'function' && typeof value !== 'object')) {
+                    return false;
+                }
+                try {
+                    if (
+                        Object.prototype.hasOwnProperty.call(value, 'className') &&
+                        typeof value.className === 'string' &&
+                        String(value.className || '').trim().length > 0
+                    ) {
+                        return true;
+                    }
+                } catch (_error) {
+                }
+                try {
+                    if (
+                        Object.prototype.hasOwnProperty.call(value, '__javaClass') &&
+                        typeof value.__javaClass === 'string' &&
+                        String(value.__javaClass || '').trim().length > 0
+                    ) {
+                        return true;
+                    }
+                } catch (_error2) {
+                }
+                return false;
+            }
+
             function normalizeInterfaceNames(interfaceNameOrNames) {
                 if (Array.isArray(interfaceNameOrNames)) {
                     return interfaceNameOrNames
                         .map(function(item) {
-                            return String(item || '').trim();
+                            return normalizeInterfaceName(item);
                         })
                         .filter(Boolean);
                 }
-                var single = String(interfaceNameOrNames || '').trim();
+                var single = normalizeInterfaceName(interfaceNameOrNames);
                 if (!single) {
                     return [];
                 }
@@ -254,7 +422,7 @@ internal fun buildJavaClassBridgeDefinition(): String {
                         ]);
                     },
                     release: function() {
-                        return !!invokeBridge('javaReleaseInstance', [handle]);
+                        return releaseInstanceHandle(handle, false);
                     },
                     toJSON: function() {
                         return {
@@ -267,7 +435,7 @@ internal fun buildJavaClassBridgeDefinition(): String {
                     }
                 };
 
-                return new Proxy(target, {
+                var proxy = new Proxy(target, {
                     get: function(obj, prop) {
                         if (prop in obj) {
                             return obj[prop];
@@ -313,6 +481,9 @@ internal fun buildJavaClassBridgeDefinition(): String {
                         return true;
                     }
                 });
+
+                registerInstanceProxy(handle, proxy);
+                return proxy;
             }
 
             function createClassProxy(className) {
@@ -373,6 +544,17 @@ internal fun buildJavaClassBridgeDefinition(): String {
                                 prop
                             ]);
                         } catch (_fieldError) {
+                        }
+                        var nestedClassName = className + '$' + prop;
+                        if (classExistsRaw(nestedClassName)) {
+                            return createClassProxy(nestedClassName);
+                        }
+                        var nestedUpperClassName = className + '$' + prop.toUpperCase();
+                        if (
+                            nestedUpperClassName !== nestedClassName &&
+                            classExistsRaw(nestedUpperClassName)
+                        ) {
+                            return createClassProxy(nestedUpperClassName);
                         }
                         return function() {
                             var args = Array.prototype.slice.call(arguments);
@@ -502,7 +684,8 @@ internal fun buildJavaClassBridgeDefinition(): String {
                         (typeof interfaceNameOrNames === 'function' ||
                             (interfaceNameOrNames &&
                                 typeof interfaceNameOrNames === 'object' &&
-                                !Array.isArray(interfaceNameOrNames)))
+                                !Array.isArray(interfaceNameOrNames))) &&
+                        !isJavaClassReference(interfaceNameOrNames)
                     ) {
                         actualImpl = interfaceNameOrNames;
                         interfaceNamesInput = [];
@@ -557,21 +740,23 @@ internal fun buildJavaClassBridgeDefinition(): String {
                     ]);
                 },
                 release: function(instanceOrHandle) {
+                    var handle = '';
                     if (
                         instanceOrHandle &&
                         typeof instanceOrHandle === 'object' &&
                         Object.prototype.hasOwnProperty.call(instanceOrHandle, '__javaHandle')
                     ) {
-                        return !!invokeBridge('javaReleaseInstance', [String(instanceOrHandle.__javaHandle)]);
+                        handle = normalizeHandleValue(instanceOrHandle.__javaHandle);
+                    } else {
+                        handle = normalizeHandleValue(instanceOrHandle);
                     }
-                    var handle = String(instanceOrHandle || '').trim();
                     if (!handle) {
                         return false;
                     }
-                    return !!invokeBridge('javaReleaseInstance', [handle]);
+                    return releaseInstanceHandle(handle, false);
                 },
                 releaseAll: function() {
-                    return invokeBridge('javaReleaseAllInstances', []);
+                    return releaseAllInstanceHandles();
                 },
                 getApplicationContext: function() {
                     return invokeBridge('javaGetApplicationContext', []);

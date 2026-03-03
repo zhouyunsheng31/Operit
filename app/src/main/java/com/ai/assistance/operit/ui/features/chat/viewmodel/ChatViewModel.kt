@@ -300,6 +300,13 @@ class ChatViewModel(private val context: Context) : ViewModel() {
             MutableStateFlow(false)
         }
     }
+    val isSendTriggeredSummarizing: StateFlow<Boolean> by lazy {
+        if (::messageCoordinationDelegate.isInitialized) {
+            messageCoordinationDelegate.isSendTriggeredSummarizing
+        } else {
+            MutableStateFlow(false)
+        }
+    }
 
     fun handleSharedLinks(urls: List<String>) {
         AppLogger.d(TAG, "handleSharedLinks called with ${urls.size} link(s)")
@@ -1257,6 +1264,13 @@ class ChatViewModel(private val context: Context) : ViewModel() {
 
     fun sendUserMessage(promptFunctionType: PromptFunctionType = PromptFunctionType.CHAT) {
         messageCoordinationDelegate.sendUserMessage(promptFunctionType)
+    }
+
+    fun sendTextMessage(text: String, promptFunctionType: PromptFunctionType = PromptFunctionType.CHAT) {
+        messageCoordinationDelegate.sendUserMessage(
+            promptFunctionType = promptFunctionType,
+            messageTextOverride = text
+        )
     }
 
     fun cancelCurrentMessage() {

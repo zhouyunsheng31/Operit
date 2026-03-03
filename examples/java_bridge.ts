@@ -2,7 +2,7 @@
  * Operit Java Bridge Tester
  *
  * Focused test suite for the new Java/Kotlin bridge runtime:
- * - Java.type / Java.use / Java.importClass / Kotlin
+ * - Java package-chain sugar / Java.use / Java.importClass / Kotlin
  * - Proxy-based class and instance calls
  * - Java.package and package-chain access
  * - Java.implement / Java.proxy / Java.releaseJs
@@ -128,7 +128,7 @@ function caseBridgeExposed(): any {
 }
 
 function caseProxyStaticAndInstance(): any {
-    const Integer = Java.type("java.lang.Integer");
+    const Integer = Java.java.lang.Integer;
     const StringBuilderA = Java.use("java.lang.StringBuilder");
     const StringBuilderB = Java.importClass("java.lang.StringBuilder");
     const StringBuilderK = Kotlin.type("java.lang.StringBuilder");
@@ -168,11 +168,11 @@ function caseProxyStaticAndInstance(): any {
 }
 
 function casePackageAccess(): any {
-    const nowByChain = Java.java.lang.System.currentTimeMillis();
-    const nowByApi = Java.callStatic("java.lang.System", "currentTimeMillis");
+    const nowByChain = Number(Java.java.lang.System.currentTimeMillis());
+    const nowByApi = Number(Java.callStatic("java.lang.System", "currentTimeMillis"));
 
-    assertTrue(typeof nowByChain === "number", "nowByChain should be number");
-    assertTrue(typeof nowByApi === "number", "nowByApi should be number");
+    assertTrue(Number.isFinite(nowByChain), "nowByChain should be finite number");
+    assertTrue(Number.isFinite(nowByApi), "nowByApi should be finite number");
     assertTrue(Math.abs(nowByChain - nowByApi) < 5000, "time delta should be small");
 
     const utilPkg = Java.package("java.util");
@@ -194,10 +194,11 @@ function casePackageAccess(): any {
 }
 
 async function caseImplementRunnable(): Promise<any> {
-    const Thread = Java.type("java.lang.Thread");
+    const Thread = Java.java.lang.Thread;
+    const Runnable = Java.java.lang.Runnable;
 
     let runCount = 0;
-    const runnable = Java.implement("java.lang.Runnable", () => {
+    const runnable = Java.implement(Runnable, () => {
         runCount += 1;
     });
 
@@ -218,7 +219,7 @@ async function caseImplementRunnable(): Promise<any> {
 }
 
 async function caseImplementShorthand(): Promise<any> {
-    const Thread = Java.type("java.lang.Thread");
+    const Thread = Java.java.lang.Thread;
 
     let runCount = 0;
     const runnable = Java.implement(() => {
@@ -242,10 +243,11 @@ async function caseImplementShorthand(): Promise<any> {
 }
 
 async function caseProxyAliasRunnable(): Promise<any> {
-    const Thread = Java.type("java.lang.Thread");
+    const Thread = Java.java.lang.Thread;
+    const Runnable = Java.java.lang.Runnable;
 
     let runCount = 0;
-    const runnable = Java.proxy("java.lang.Runnable", {
+    const runnable = Java.proxy(Runnable, {
         run() {
             runCount += 1;
         }
@@ -268,10 +270,11 @@ async function caseProxyAliasRunnable(): Promise<any> {
 }
 
 async function caseImplementCallableReturn(): Promise<any> {
-    const FutureTask = Java.type("java.util.concurrent.FutureTask");
-    const Thread = Java.type("java.lang.Thread");
+    const FutureTask = Java.java.util.concurrent.FutureTask;
+    const Thread = Java.java.lang.Thread;
+    const Callable = Java.java.util.concurrent.Callable;
 
-    const callable = Java.implement("java.util.concurrent.Callable", {
+    const callable = Java.implement(Callable, {
         call() {
             return "callable-ok";
         }
@@ -313,12 +316,12 @@ function caseNativeLowLevel(): any {
 }
 
 function caseAndroidBridgeDirect(): any {
-    const Build = Java.type("android.os.Build");
-    const Version = Java.type("android.os.Build$VERSION");
-    const Process = Java.type("android.os.Process");
-    const SystemClock = Java.type("android.os.SystemClock");
-    const ActivityLifecycleManager = Java.type("com.ai.assistance.operit.core.application.ActivityLifecycleManager");
-    const AlertDialogBuilder = Java.type("android.app.AlertDialog$Builder");
+    const Build = Java.android.os.Build;
+    const Version = Java.android.os.Build.VERSION;
+    const Process = Java.android.os.Process;
+    const SystemClock = Java.android.os.SystemClock;
+    const ActivityLifecycleManager = Java.com.ai.assistance.operit.core.application.ActivityLifecycleManager;
+    const AlertDialogBuilder = Java.android.app.AlertDialog.Builder;
 
     const manufacturer = String(Build.MANUFACTURER || "");
     const model = String(Build.MODEL || "");
@@ -372,7 +375,7 @@ function caseAndroidBridgeDirect(): any {
 }
 
 function caseReleaseAll(): any {
-    const ArrayList = Java.type("java.util.ArrayList");
+    const ArrayList = Java.java.util.ArrayList;
     const a = new ArrayList();
     const b = new ArrayList();
 
@@ -398,7 +401,6 @@ const BRIDGE_CASES: BridgeCaseDefinition[] = [
     { name: "implement_callable_return", handler: caseImplementCallableReturn },
     { name: "native_low_level", handler: caseNativeLowLevel },
     { name: "android_bridge_direct", handler: caseAndroidBridgeDirect },
-    { name: "android_alert_direct", handler: caseAndroidBridgeDirect },
     { name: "release_all", handler: caseReleaseAll }
 ];
 

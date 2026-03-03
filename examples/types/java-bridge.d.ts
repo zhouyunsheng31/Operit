@@ -27,13 +27,65 @@ export interface JavaBridgeJsInterfaceMarker {
 }
 
 /**
+ * Primitive values that can cross the bridge directly.
+ */
+export type JavaBridgePrimitive =
+    string |
+    number |
+    boolean |
+    bigint |
+    null |
+    undefined;
+
+/**
+ * Structured object payload passed through bridge conversion.
+ */
+export interface JavaBridgeRecord {
+    [key: string]: JavaBridgeValue;
+}
+
+/**
+ * Dynamic value model for bridge inputs/outputs.
+ * Keep this broad enough for runtime behavior while avoiding `any`.
+ */
+export type JavaBridgeValue =
+    JavaBridgePrimitive |
+    JavaBridgeRecord |
+    JavaBridgeValue[] |
+    JavaBridgeHandle |
+    JavaBridgeJsInterfaceMarker |
+    JavaBridgeInstance |
+    JavaBridgeClass |
+    JavaBridgePackage;
+
+/**
+ * Argument type accepted by Java bridge dynamic calls.
+ */
+export type JavaBridgeArg = JavaBridgeValue;
+
+/**
  * JS implementation target for Java interface callbacks.
  * - function: single callable target (SAM-style usage)
  * - object: method-name based implementation
  */
+export type JavaBridgeCallbackResult = JavaBridgeValue | void;
+
+export type JavaBridgeJsMethod = (...args: JavaBridgeArg[]) => JavaBridgeCallbackResult;
+
 export type JavaBridgeJsInterfaceImpl =
-    ((...args: any[]) => any) |
-    Record<string, any>;
+    JavaBridgeJsMethod |
+    Record<string, JavaBridgeJsMethod | JavaBridgeValue>;
+
+/**
+ * Interface reference accepted by `Java.implement(...)` / `Java.proxy(...)`.
+ * Supports both string class names and Java class proxies (e.g. `Java.java.lang.Runnable`).
+ */
+export type JavaBridgeInterfaceRef = string | JavaBridgeClass;
+
+/**
+ * Dynamic callable member returned from proxy fallbacks.
+ */
+export type JavaBridgeDynamicCallable = (...args: JavaBridgeArg[]) => JavaBridgeValue;
 
 /**
  * Dynamic proxy object for a Java/Kotlin instance.
@@ -44,11 +96,11 @@ export interface JavaBridgeInstance extends JavaBridgeHandle {
     readonly className: string;
     readonly handle: string;
 
-    call<T = any>(methodName: string, ...args: any[]): T;
-    get<T = any>(): T;
-    get<T = any>(fieldName: string): T;
-    set<T = any>(value: any): T;
-    set<T = any>(fieldName: string, value: any): T;
+    call<T extends JavaBridgeValue = JavaBridgeValue>(methodName: string, ...args: JavaBridgeArg[]): T;
+    get<T extends JavaBridgeValue = JavaBridgeValue>(): T;
+    get<T extends JavaBridgeValue = JavaBridgeValue>(fieldName: string): T;
+    set<T extends JavaBridgeValue = JavaBridgeValue>(value: JavaBridgeArg): T;
+    set<T extends JavaBridgeValue = JavaBridgeValue>(fieldName: string, value: JavaBridgeArg): T;
     release(): boolean;
 
     toJSON(): JavaBridgeHandle;
@@ -63,16 +115,16 @@ export interface JavaBridgeInstance extends JavaBridgeHandle {
  * - Unknown property writes are treated as static field/property set.
  */
 export interface JavaBridgeClass {
-    (...args: any[]): JavaBridgeInstance;
-    new (...args: any[]): JavaBridgeInstance;
+    (...args: JavaBridgeArg[]): JavaBridgeInstance;
+    new (...args: JavaBridgeArg[]): JavaBridgeInstance;
 
     readonly className: string;
 
     exists(): boolean;
-    newInstance<T extends JavaBridgeInstance = JavaBridgeInstance>(...args: any[]): T;
-    callStatic<T = any>(methodName: string, ...args: any[]): T;
-    getStatic<T = any>(fieldName: string): T;
-    setStatic<T = any>(fieldName: string, value: any): T;
+    newInstance<T extends JavaBridgeInstance = JavaBridgeInstance>(...args: JavaBridgeArg[]): T;
+    callStatic<T extends JavaBridgeValue = JavaBridgeValue>(methodName: string, ...args: JavaBridgeArg[]): T;
+    getStatic<T extends JavaBridgeValue = JavaBridgeValue>(fieldName: string): T;
+    setStatic<T extends JavaBridgeValue = JavaBridgeValue>(fieldName: string, value: JavaBridgeArg): T;
     toString(): string;
 
     [member: string]: any;
@@ -83,13 +135,13 @@ export interface JavaBridgeClass {
  * - e.g. `Java.java.lang.System`
  */
 export interface JavaBridgePackage {
-    (...args: any[]): JavaBridgeInstance;
-    new (...args: any[]): JavaBridgeInstance;
+    (...args: JavaBridgeArg[]): JavaBridgeInstance;
+    new (...args: JavaBridgeArg[]): JavaBridgeInstance;
 
     readonly path: string;
     toString(): string;
 
-    [member: string]: any;
+    [member: string]: JavaBridgeClass | JavaBridgePackage;
 }
 
 /**
@@ -100,16 +152,16 @@ export interface JavaBridgeApi {
     use(className: string): JavaBridgeClass;
     importClass(className: string): JavaBridgeClass;
     package(packageName: string): JavaBridgePackage;
-    implement(interfaceName: string, impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
-    implement(interfaceNames: string[], impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
+    implement(interfaceName: JavaBridgeInterfaceRef, impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
+    implement(interfaceNames: JavaBridgeInterfaceRef[], impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
     implement(impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
-    proxy(interfaceName: string, impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
-    proxy(interfaceNames: string[], impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
+    proxy(interfaceName: JavaBridgeInterfaceRef, impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
+    proxy(interfaceNames: JavaBridgeInterfaceRef[], impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
     proxy(impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
     releaseJs(objectOrId: JavaBridgeJsInterfaceMarker | string): boolean;
     classExists(className: string): boolean;
-    callStatic<T = any>(className: string, methodName: string, ...args: any[]): T;
-    newInstance<T extends JavaBridgeInstance = JavaBridgeInstance>(className: string, ...args: any[]): T;
+    callStatic<T extends JavaBridgeValue = JavaBridgeValue>(className: string, methodName: string, ...args: JavaBridgeArg[]): T;
+    newInstance<T extends JavaBridgeInstance = JavaBridgeInstance>(className: string, ...args: JavaBridgeArg[]): T;
     release(instanceOrHandle: JavaBridgeInstance | JavaBridgeHandle | string): boolean;
     releaseAll(): number;
     getApplicationContext<T extends JavaBridgeInstance = JavaBridgeInstance>(): T;
@@ -117,5 +169,5 @@ export interface JavaBridgeApi {
     getCurrentActivity<T extends JavaBridgeInstance = JavaBridgeInstance>(): T;
     getActivity<T extends JavaBridgeInstance = JavaBridgeInstance>(): T;
 
-    [member: string]: any;
+    [member: string]: JavaBridgeClass | JavaBridgePackage;
 }
