@@ -1,32 +1,17 @@
 package com.ai.assistance.operit.core.tools.javascript
 
 import android.content.Context
-import com.ai.assistance.operit.util.AppLogger
 
-internal fun loadPakoJs(context: Context): String {
+internal fun loadPakoJs(context: Context): String = loadEmbeddedLibrary(context, "js/pako.js")
+
+internal fun loadCryptoJs(context: Context): String = loadEmbeddedLibrary(context, "js/CryptoJS.js")
+
+internal fun loadJimpJs(context: Context): String = loadEmbeddedLibrary(context, "js/Jimp.js")
+
+private fun loadEmbeddedLibrary(context: Context, assetPath: String): String {
     return try {
-        context.assets.open("js/pako.js").bufferedReader().use { it.readText() }
-    } catch (e: Exception) {
-        AppLogger.e("JsEngine", "Failed to load pako.js", e)
-        "// pako.js failed to load"
+        context.assets.open(assetPath).bufferedReader().use { it.readText() }
+    } catch (_: Exception) {
+        ""
     }
 }
-
-internal fun loadCryptoJs(context: Context): String {
-    return try {
-        context.assets.open("js/CryptoJS.js").bufferedReader().use { it.readText() }
-    } catch (e: Exception) {
-        AppLogger.e("JsEngine", "Failed to load CryptoJS.js", e)
-        "// CryptoJS.js failed to load"
-    }
-}
-
-internal fun loadJimpJs(context: Context): String {
-    return try {
-        context.assets.open("js/Jimp.js").bufferedReader().use { it.readText() }
-    } catch (e: Exception) {
-        AppLogger.e("JsEngine", "Failed to load Jimp.js", e)
-        "// Jimp.js failed to load"
-    }
-}
-

@@ -7,6 +7,8 @@ import androidx.compose.ui.text.input.TextFieldValue
 import com.ai.assistance.operit.R
 import com.ai.assistance.operit.api.chat.EnhancedAIService
 import com.ai.assistance.operit.core.chat.AIMessageManager
+import com.ai.assistance.operit.core.chat.logMessageTiming
+import com.ai.assistance.operit.core.chat.messageTimingNow
 import com.ai.assistance.operit.core.tools.AIToolHandler
 import com.ai.assistance.operit.core.tools.agent.PhoneAgentJobRegistry
 import com.ai.assistance.operit.data.model.*
@@ -199,13 +201,14 @@ class MessageProcessingDelegate(
         workspaceEnv: String?,
         replyToMessage: ChatMessage?
     ): String {
+        val totalStartTime = messageTimingNow()
         val configId = functionalConfigManager.getConfigIdForFunction(FunctionType.CHAT)
         val currentModelConfig = modelConfigManager.getModelConfigFlow(configId).first()
         val enableDirectImageProcessing = currentModelConfig.enableDirectImageProcessing
         val enableDirectAudioProcessing = currentModelConfig.enableDirectAudioProcessing
         val enableDirectVideoProcessing = currentModelConfig.enableDirectVideoProcessing
 
-        return AIMessageManager.buildUserMessageContent(
+        val finalMessageContent = AIMessageManager.buildUserMessageContent(
             messageText = messageText,
             attachments = attachments,
             enableMemoryQuery = enableMemoryQuery,
@@ -217,6 +220,12 @@ class MessageProcessingDelegate(
             enableDirectAudioProcessing = enableDirectAudioProcessing,
             enableDirectVideoProcessing = enableDirectVideoProcessing
         )
+        logMessageTiming(
+            stage = "delegate.groupOrchestration.buildUserMessageContent",
+            startTimeMs = totalStartTime,
+            details = "attachments=${attachments.size}, configId=$configId, finalLength=${finalMessageContent.length}"
+        )
+        return finalMessageContent
     }
 
     fun getResponseStream(chatId: String): SharedStream<String>? {
@@ -316,6 +325,7 @@ class MessageProcessingDelegate(
         setChatInputProcessingState(chatId, EnhancedInputProcessingState.Processing(context.getString(R.string.message_processing)))
 
         coroutineScope.launch(Dispatchers.IO) {
+            val sendUserMessageStartTime = messageTimingNow()
             // 检查这是否是聊天中的第一条用户消息（忽略AI的开场白）
             val isFirstMessage = getChatHistory(chatId).none { it.sender == "user" }
             if (isFirstMessage && chatId != null) {
@@ -333,13 +343,20 @@ class MessageProcessingDelegate(
             // 获取当前模型配置以检查是否启用直接图片处理
             val configId = chatModelConfigIdOverride?.takeIf { it.isNotBlank() }
                 ?: functionalConfigManager.getConfigIdForFunction(FunctionType.CHAT)
+            val loadModelConfigStartTime = messageTimingNow()
             val currentModelConfig = modelConfigManager.getModelConfigFlow(configId).first()
             val enableDirectImageProcessing = currentModelConfig.enableDirectImageProcessing
             val enableDirectAudioProcessing = currentModelConfig.enableDirectAudioProcessing
             val enableDirectVideoProcessing = currentModelConfig.enableDirectVideoProcessing
             AppLogger.d(TAG, "直接图片处理状态: $enableDirectImageProcessing (配置ID: $configId)")
+            logMessageTiming(
+                stage = "delegate.loadModelConfig",
+                startTimeMs = loadModelConfigStartTime,
+                details = "chatId=$chatId, configId=$configId"
+            )
 
             // 1. 使用 AIMessageManager 构建最终消息
+            val buildUserMessageStartTime = messageTimingNow()
             val finalMessageContent = AIMessageManager.buildUserMessageContent(
                 messageText,
                 proxySenderNameOverride,
@@ -352,6 +369,11 @@ class MessageProcessingDelegate(
                 enableDirectImageProcessing,
                 enableDirectAudioProcessing,
                 enableDirectVideoProcessing
+            )
+            logMessageTiming(
+                stage = "delegate.buildUserMessageContent",
+                startTimeMs = buildUserMessageStartTime,
+                details = "chatId=$chatId, attachments=${attachments.size}, finalLength=${finalMessageContent.length}"
             )
 
             // 自动继续且原本消息为空时，不添加到聊天历史（虽然会发送"继续"给AI）
@@ -376,6 +398,7 @@ class MessageProcessingDelegate(
 
             // 在消息发送期间临时挂载 workspace hook，结束后卸载
             if (!workspacePath.isNullOrBlank()) {
+                val attachWorkspaceHookStartTime = messageTimingNow()
                 try {
                     val session =
                         WorkspaceBackupManager.getInstance(context)
@@ -391,6 +414,11 @@ class MessageProcessingDelegate(
                         TAG,
                         "Workspace hook attached for timestamp=${userMessage.timestamp}, path=$workspacePath"
                     )
+                    logMessageTiming(
+                        stage = "delegate.attachWorkspaceHook",
+                        startTimeMs = attachWorkspaceHookStartTime,
+                        details = "chatId=$chatId, workspacePath=$workspacePath"
+                    )
                 } catch (e: Exception) {
                     AppLogger.e(TAG, "Failed to attach workspace hook", e)
                     _nonFatalErrorEvent.emit(context.getString(R.string.message_workspace_sync_failed, e.message))
@@ -399,8 +427,14 @@ class MessageProcessingDelegate(
 
             if (shouldAddUserMessageToChat && chatId != null) {
                 // 等待消息添加到聊天历史完成，确保getChatHistory()包含新消息
+                val addUserMessageStartTime = messageTimingNow()
                 addMessageToChat(chatId, userMessage)
                 userMessageAdded = true
+                logMessageTiming(
+                    stage = "delegate.addUserMessageToChat",
+                    startTimeMs = addUserMessageStartTime,
+                    details = "chatId=$chatId, contentLength=${userMessage.content.length}"
+                )
             }
 
             lateinit var aiMessage: ChatMessage
@@ -418,8 +452,10 @@ class MessageProcessingDelegate(
                 //     return@launch
                 // }
 
+                val acquireServiceStartTime = messageTimingNow()
+                val chatScopedService = EnhancedAIService.getChatInstance(context, activeChatId)
                 val service =
-                    (EnhancedAIService.getChatInstance(context, activeChatId)
+                    (chatScopedService
                         ?: getEnhancedAiService())
                         ?: run {
                             withContext(Dispatchers.Main) { showErrorMessage(context.getString(R.string.message_ai_service_not_initialized)) }
@@ -428,6 +464,11 @@ class MessageProcessingDelegate(
                             setChatInputProcessingState(activeChatId, EnhancedInputProcessingState.Idle)
                             return@launch
                         }
+                logMessageTiming(
+                    stage = "delegate.acquireService",
+                    startTimeMs = acquireServiceStartTime,
+                    details = "chatId=$activeChatId, reusedChatInstance=${chatScopedService != null}"
+                )
                 serviceForTurnComplete = service
 
                 // 清除上一次可能残留的 Error 状态，避免 StateFlow 重放导致新一轮发送立即再次触发弹窗
@@ -455,12 +496,13 @@ class MessageProcessingDelegate(
                         }
                     }
 
-                val startTime = System.currentTimeMillis()
+                val responseStartTime = messageTimingNow()
                 val deferred = CompletableDeferred<Unit>()
 
                 val userPreferencesManager = UserPreferencesManager.getInstance(context)
 
                 // 获取角色信息用于通知
+                val loadRoleInfoStartTime = messageTimingNow()
                 val (characterName, avatarUri) = try {
                     val roleCard = characterCardManager.getCharacterCardFlow(effectiveRoleCardId).first()
                     val avatar =
@@ -471,8 +513,19 @@ class MessageProcessingDelegate(
                     Pair(null, null)
                 }
                 val currentRoleName = characterName ?: "Operit"
+                logMessageTiming(
+                    stage = "delegate.loadRoleInfo",
+                    startTimeMs = loadRoleInfoStartTime,
+                    details = "chatId=$activeChatId, roleCardId=$effectiveRoleCardId, roleName=$currentRoleName"
+                )
 
+                val loadChatHistoryStartTime = messageTimingNow()
                 val chatHistory = getChatHistory(activeChatId)
+                logMessageTiming(
+                    stage = "delegate.loadChatHistory",
+                    startTimeMs = loadChatHistoryStartTime,
+                    details = "chatId=$activeChatId, size=${chatHistory.size}"
+                )
 
                 // 根据enableSummary控制Token阈值检查和Token超限回调
                 val effectiveMaxTokens = if (enableSummary) maxTokens else 0
@@ -495,6 +548,7 @@ class MessageProcessingDelegate(
                         finalMessageContent
                     }
 
+                val prepareResponseStreamStartTime = messageTimingNow()
                 val responseStream = AIMessageManager.sendMessage(
                     enhancedAiService = service,
                     chatId = activeChatId,
@@ -527,28 +581,41 @@ class MessageProcessingDelegate(
                     chatModelConfigIdOverride = chatModelConfigIdOverride,
                     chatModelIndexOverride = chatModelIndexOverride
                 )
+                logMessageTiming(
+                    stage = "delegate.prepareResponseStream",
+                    startTimeMs = prepareResponseStreamStartTime,
+                    details = "chatId=$activeChatId, requestLength=${requestMessageContent.length}, history=${chatHistory.size}"
+                )
 
                 // 将字符串流共享，以便多个收集器可以使用
                 // 关键修改：设置 replay = Int.MAX_VALUE，确保 UI 重组（重新订阅）时能收到所有历史字符
                 // 文本数据占用内存极小，全量缓冲不会造成内存压力
+                val shareResponseStreamStartTime = messageTimingNow()
                 val sharedCharStream =
                     responseStream.share(
                         scope = coroutineScope,
                         replay = Int.MAX_VALUE, 
                         onComplete = {
                             deferred.complete(Unit)
-                            AppLogger.d(
-                                TAG,
-                                "共享流完成，耗时: ${System.currentTimeMillis() - startTime}ms"
+                            logMessageTiming(
+                                stage = "delegate.sharedStreamComplete",
+                                startTimeMs = responseStartTime,
+                                details = "chatId=$activeChatId"
                             )
                             chatRuntime.responseStream = null
                         }
                     )
+                logMessageTiming(
+                    stage = "delegate.shareResponseStream",
+                    startTimeMs = shareResponseStreamStartTime,
+                    details = "chatId=$activeChatId"
+                )
 
                 // 更新当前响应流，使其可以被其他组件（如悬浮窗）访问
                 chatRuntime.responseStream = sharedCharStream
 
                 // 获取当前使用的provider和model信息
+                val loadProviderModelStartTime = messageTimingNow()
                 val (provider, modelName) = try {
                     service.getProviderAndModelForFunction(
                         functionType = com.ai.assistance.operit.data.model.FunctionType.CHAT,
@@ -559,6 +626,11 @@ class MessageProcessingDelegate(
                     AppLogger.e(TAG, "获取provider和model信息失败: ${e.message}", e)
                     Pair("", "")
                 }
+                logMessageTiming(
+                    stage = "delegate.loadProviderModel",
+                    startTimeMs = loadProviderModelStartTime,
+                    details = "chatId=$activeChatId, provider=$provider, model=$modelName"
+                )
 
                 aiMessage = ChatMessage(
                     sender = "ai", 
@@ -591,6 +663,7 @@ class MessageProcessingDelegate(
                 chatRuntime.streamCollectionJob =
                     coroutineScope.launch(Dispatchers.IO) {
                         try {
+                            var hasLoggedFirstChunk = false
                             val contentBuilder = StringBuilder()
                             val autoReadBuffer = StringBuilder()
                             var isFirstAutoReadSegment = true
@@ -638,6 +711,14 @@ class MessageProcessingDelegate(
                             }
 
                             sharedCharStream.collect { chunk ->
+                                if (!hasLoggedFirstChunk) {
+                                    hasLoggedFirstChunk = true
+                                    logMessageTiming(
+                                        stage = "delegate.firstResponseChunk",
+                                        startTimeMs = responseStartTime,
+                                        details = "chatId=$activeChatId, firstChunkLength=${chunk.length}"
+                                    )
+                                }
                                 contentBuilder.append(chunk)
                                 val content = contentBuilder.toString()
                                 val updatedMessage = aiMessage.copy(content = content)
@@ -694,7 +775,11 @@ class MessageProcessingDelegate(
                     )
                 }
 
-                AppLogger.d(TAG, "AI响应处理完成，总耗时: ${System.currentTimeMillis() - startTime}ms")
+                logMessageTiming(
+                    stage = "delegate.responseProcessingComplete",
+                    startTimeMs = responseStartTime,
+                    details = "chatId=$activeChatId, waifu=$isWaifuModeEnabled, autoRead=$didStreamAutoRead"
+                )
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) {
                     AppLogger.d(TAG, "消息发送被取消")
@@ -709,6 +794,7 @@ class MessageProcessingDelegate(
                 )
                 withContext(Dispatchers.Main) { showErrorMessage(context.getString(R.string.message_send_failed, e.message)) }
             } finally {
+                val finalizeMessageStartTime = messageTimingNow()
                 finalizeMessageAndNotify(
                     chatId = chatId,
                     activeChatId = activeChatId,
@@ -720,15 +806,37 @@ class MessageProcessingDelegate(
                     chatModelConfigIdOverride = chatModelConfigIdOverride,
                     chatModelIndexOverride = chatModelIndexOverride
                 )
+                logMessageTiming(
+                    stage = "delegate.finalizeMessage",
+                    startTimeMs = finalizeMessageStartTime,
+                    details = "chatId=$activeChatId, notifyTurnComplete=$shouldNotifyTurnComplete"
+                )
 
                 workspaceToolHookSession?.let { session ->
+                    val cleanupWorkspaceHookStartTime = messageTimingNow()
                     runCatching { toolHandler.removeToolHook(session) }
                         .onFailure { AppLogger.w(TAG, "Failed to remove workspace hook", it) }
                     runCatching { session.close() }
                         .onFailure { AppLogger.w(TAG, "Failed to close workspace hook session", it) }
+                    logMessageTiming(
+                        stage = "delegate.cleanupWorkspaceHook",
+                        startTimeMs = cleanupWorkspaceHookStartTime,
+                        details = "chatId=$activeChatId"
+                    )
                 }
 
+                val cleanupRuntimeStartTime = messageTimingNow()
                 cleanupRuntimeAfterSend(chatRuntime)
+                logMessageTiming(
+                    stage = "delegate.cleanupRuntime",
+                    startTimeMs = cleanupRuntimeStartTime,
+                    details = "chatId=$activeChatId"
+                )
+                logMessageTiming(
+                    stage = "delegate.sendUserMessage.total",
+                    startTimeMs = sendUserMessageStartTime,
+                    details = "chatId=$activeChatId, addedUserMessage=$userMessageAdded, enableSummary=$enableSummary"
+                )
             }
         }
     }

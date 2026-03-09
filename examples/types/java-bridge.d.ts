@@ -88,6 +88,24 @@ export type JavaBridgeInterfaceRef = string | JavaBridgeClass;
 export type JavaBridgeDynamicCallable = (...args: JavaBridgeArg[]) => JavaBridgeValue;
 
 /**
+ * Options accepted by `Java.loadDex(...)` / `Java.loadJar(...)`.
+ */
+export interface JavaBridgeExternalCodeLoadOptions {
+    nativeLibraryDir?: string;
+}
+
+/**
+ * One external dex/jar artifact registered into the Java bridge class loader chain.
+ */
+export interface JavaBridgeLoadedCodePath {
+    index: number;
+    type: 'dex' | 'jar';
+    path: string;
+    nativeLibraryDir: string | null;
+    alreadyLoaded: boolean;
+}
+
+/**
  * Dynamic proxy object for a Java/Kotlin instance.
  * - Unknown property reads first try instance field/property get, then fallback to method callable.
  * - Unknown property writes are treated as instance field/property set.
@@ -102,7 +120,6 @@ export interface JavaBridgeInstance extends JavaBridgeHandle {
     get<T extends JavaBridgeValue = JavaBridgeValue>(fieldName: string): T;
     set<T extends JavaBridgeValue = JavaBridgeValue>(value: JavaBridgeArg): T;
     set<T extends JavaBridgeValue = JavaBridgeValue>(fieldName: string, value: JavaBridgeArg): T;
-    release(): boolean;
 
     toJSON(): JavaBridgeHandle;
     toString(): string;
@@ -160,13 +177,13 @@ export interface JavaBridgeApi {
     proxy(interfaceName: JavaBridgeInterfaceRef, impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
     proxy(interfaceNames: JavaBridgeInterfaceRef[], impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
     proxy(impl: JavaBridgeJsInterfaceImpl): JavaBridgeJsInterfaceMarker;
-    releaseJs(objectOrId: JavaBridgeJsInterfaceMarker | string): boolean;
     classExists(className: string): boolean;
+    loadDex(path: string, options?: string | JavaBridgeExternalCodeLoadOptions): JavaBridgeLoadedCodePath;
+    loadJar(path: string, options?: string | JavaBridgeExternalCodeLoadOptions): JavaBridgeLoadedCodePath;
+    listLoadedCodePaths(): JavaBridgeLoadedCodePath[];
     callStatic<T extends JavaBridgeValue = JavaBridgeValue>(className: string, methodName: string, ...args: JavaBridgeArg[]): T;
     callSuspend(className: string, methodName: string, ...args: JavaBridgeArg[]): Promise<JavaBridgeValue>;
     newInstance<T extends JavaBridgeInstance = JavaBridgeInstance>(className: string, ...args: JavaBridgeArg[]): T;
-    release(instanceOrHandle: JavaBridgeInstance | JavaBridgeHandle | string): boolean;
-    releaseAll(): number;
     getApplicationContext<T extends JavaBridgeInstance = JavaBridgeInstance>(): T;
     getContext<T extends JavaBridgeInstance = JavaBridgeInstance>(): T;
     getCurrentActivity<T extends JavaBridgeInstance = JavaBridgeInstance>(): T;

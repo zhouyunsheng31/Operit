@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "toolpkg_id": "com.operit.apktool_bundle",
+  "version": "0.3.0",
+  "main": "dist/main.js",
+  "display_name": {
+    "zh": "Apktool 工具包",
+    "en": "Apktool Bundle"
+  },
+  "description": {
+    "zh": "通过 ToolPkg.readResource + Java.loadJar 载入内置 apktool runtime，并直接调用 brut.androlib.* 类。",
+    "en": "Load the bundled apktool runtime through ToolPkg.readResource + Java.loadJar, then directly call brut.androlib.* classes."
+  },
+  "subpackages": [
+    {
+      "id": "apktool",
+      "entry": "dist/packages/apktool.js"
+    }
+  ],
+  "resources": [
+    {
+      "key": "apktool_runtime_android_jar",
+      "path": "resources/apktool/apktool-runtime-android.jar",
+      "mime": "application/java-archive"
+    }
+  ]
+}

@@ -38,6 +38,9 @@
     public static final ** CREATOR;
 }
 
+# 保留 QuickJS 反射绑定对象
+-keep class com.ai.assistance.operit.core.tools.javascript.JsEngine$JsToolCallInterface { *; }
+
 # Rules to suppress R8 warnings about missing classes
 # SVG Support
 -dontwarn com.caverock.androidsvg.SVG

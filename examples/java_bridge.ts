@@ -5,7 +5,7 @@
  * - Java package-chain sugar / Java.use / Java.importClass / Kotlin
  * - Proxy-based class and instance calls
  * - Java.package and package-chain access
- * - Java.implement / Java.proxy / Java.releaseJs
+ * - Java.implement / Java.proxy
  * - NativeInterface.java* low-level bridge
  */
 
@@ -47,27 +47,6 @@ function assertTrue(condition: any, message: string): void {
 function assertEq(actual: any, expected: any, message: string): void {
     if (actual !== expected) {
         throw new Error(`${message} | expected=${String(expected)} actual=${String(actual)}`);
-    }
-}
-
-function safeReleaseJava(instanceOrHandle: any): void {
-    try {
-        if (!instanceOrHandle) {
-            return;
-        }
-        if (typeof instanceOrHandle.release === "function") {
-            instanceOrHandle.release();
-            return;
-        }
-        Java.release(instanceOrHandle);
-    } catch (_error) {
-    }
-}
-
-function safeReleaseJs(markerOrId: any): void {
-    try {
-        Java.releaseJs(markerOrId);
-    } catch (_error) {
     }
 }
 
@@ -145,21 +124,15 @@ function caseProxyStaticAndInstance(): any {
     const sbB = StringBuilderB();
     const sbK = new StringBuilderK();
 
-    try {
-        sbA.append("A");
-        sbA.append("B");
-        sbB.append("C");
-        sbK.append("K");
+    sbA.append("A");
+    sbA.append("B");
+    sbB.append("C");
+    sbK.append("K");
 
-        assertEq(sbA.toString(), "AB", "sbA content mismatch");
-        assertEq(sbB.toString(), "C", "sbB content mismatch");
-        assertEq(sbK.toString(), "K", "sbK content mismatch");
-        assertEq(sbA.length(), 2, "sbA length mismatch");
-    } finally {
-        safeReleaseJava(sbA);
-        safeReleaseJava(sbB);
-        safeReleaseJava(sbK);
-    }
+    assertEq(sbA.toString(), "AB", "sbA content mismatch");
+    assertEq(sbB.toString(), "C", "sbB content mismatch");
+    assertEq(sbK.toString(), "K", "sbK content mismatch");
+    assertEq(sbA.length(), 2, "sbA length mismatch");
 
     return {
         integerMax: maxValue,
@@ -179,13 +152,9 @@ function casePackageAccess(): any {
     const ArrayList = utilPkg.ArrayList;
     const list = new ArrayList();
 
-    try {
-        list.add("x");
-        list.add("y");
-        assertEq(list.size(), 2, "ArrayList size mismatch");
-    } finally {
-        safeReleaseJava(list);
-    }
+    list.add("x");
+    list.add("y");
+    assertEq(list.size(), 2, "ArrayList size mismatch");
 
     return {
         nowByChain,
@@ -203,15 +172,10 @@ async function caseImplementRunnable(): Promise<any> {
     });
 
     const worker = new Thread(runnable);
-    try {
-        worker.start();
-        await waitUntil(() => runCount > 0, 4000, 20);
-        worker.join(2000);
-        assertEq(runCount, 1, "Runnable should run exactly once");
-    } finally {
-        safeReleaseJava(worker);
-        safeReleaseJs(runnable);
-    }
+    worker.start();
+    await waitUntil(() => runCount > 0, 4000, 20);
+    worker.join(2000);
+    assertEq(runCount, 1, "Runnable should run exactly once");
 
     return {
         runCount
@@ -227,15 +191,10 @@ async function caseImplementShorthand(): Promise<any> {
     });
 
     const worker = new Thread(runnable);
-    try {
-        worker.start();
-        await waitUntil(() => runCount > 0, 4000, 20);
-        worker.join(2000);
-        assertEq(runCount, 1, "Shorthand implement should run once");
-    } finally {
-        safeReleaseJava(worker);
-        safeReleaseJs(runnable);
-    }
+    worker.start();
+    await waitUntil(() => runCount > 0, 4000, 20);
+    worker.join(2000);
+    assertEq(runCount, 1, "Shorthand implement should run once");
 
     return {
         runCount
@@ -254,15 +213,10 @@ async function caseProxyAliasRunnable(): Promise<any> {
     });
 
     const worker = new Thread(runnable);
-    try {
-        worker.start();
-        await waitUntil(() => runCount > 0, 4000, 20);
-        worker.join(2000);
-        assertEq(runCount, 1, "Java.proxy runnable should run once");
-    } finally {
-        safeReleaseJava(worker);
-        safeReleaseJs(runnable);
-    }
+    worker.start();
+    await waitUntil(() => runCount > 0, 4000, 20);
+    worker.join(2000);
+    assertEq(runCount, 1, "Java.proxy runnable should run once");
 
     return {
         runCount
@@ -283,19 +237,13 @@ async function caseImplementCallableReturn(): Promise<any> {
     const future = new FutureTask(callable);
     const worker = new Thread(future);
 
-    try {
-        worker.start();
-        await waitUntil(() => future.isDone(), 5000, 20);
-        const value = future.get();
-        assertEq(String(value), "callable-ok", "Callable return value mismatch");
-        return {
-            callableResult: String(value)
-        };
-    } finally {
-        safeReleaseJava(worker);
-        safeReleaseJava(future);
-        safeReleaseJs(callable);
-    }
+    worker.start();
+    await waitUntil(() => future.isDone(), 5000, 20);
+    const value = future.get();
+    assertEq(String(value), "callable-ok", "Callable return value mismatch");
+    return {
+        callableResult: String(value)
+    };
 }
 
 function caseNativeLowLevel(): any {
@@ -348,10 +296,6 @@ function caseAndroidBridgeDirect(): any {
         alertShown = true;
     } catch (error) {
         alertError = String(error);
-    } finally {
-        safeReleaseJava(dialog);
-        safeReleaseJava(builder);
-        safeReleaseJava(activity);
     }
 
     assertTrue(manufacturer.length > 0, "manufacturer should not be empty");
@@ -374,23 +318,6 @@ function caseAndroidBridgeDirect(): any {
     };
 }
 
-function caseReleaseAll(): any {
-    const ArrayList = Java.java.util.ArrayList;
-    const a = new ArrayList();
-    const b = new ArrayList();
-
-    a.add("a");
-    b.add("b");
-
-    const released = Java.releaseAll();
-    assertTrue(typeof released === "number", "releaseAll should return number");
-    assertTrue(released >= 2, "releaseAll should release at least 2 handles in this case");
-
-    return {
-        released
-    };
-}
-
 const BRIDGE_CASES: BridgeCaseDefinition[] = [
     { name: "bridge_exposed", handler: caseBridgeExposed },
     { name: "proxy_static_and_instance", handler: caseProxyStaticAndInstance },
@@ -400,8 +327,7 @@ const BRIDGE_CASES: BridgeCaseDefinition[] = [
     { name: "proxy_alias_runnable", handler: caseProxyAliasRunnable },
     { name: "implement_callable_return", handler: caseImplementCallableReturn },
     { name: "native_low_level", handler: caseNativeLowLevel },
-    { name: "android_bridge_direct", handler: caseAndroidBridgeDirect },
-    { name: "release_all", handler: caseReleaseAll }
+    { name: "android_bridge_direct", handler: caseAndroidBridgeDirect }
 ];
 
 async function main(params: BridgeTestParams = {}): Promise<void> {

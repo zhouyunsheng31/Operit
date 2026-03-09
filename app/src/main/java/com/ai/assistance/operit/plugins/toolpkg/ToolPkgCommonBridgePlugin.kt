@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.compose.ui.graphics.Color
 import com.ai.assistance.operit.R
 import com.ai.assistance.operit.core.application.OperitApplication
+import com.ai.assistance.operit.core.chat.logMessageTiming
+import com.ai.assistance.operit.core.chat.messageTimingNow
 import com.ai.assistance.operit.core.chat.plugins.MessageProcessingController
 import com.ai.assistance.operit.core.chat.plugins.MessageProcessingExecution
 import com.ai.assistance.operit.core.chat.plugins.MessageProcessingHookParams
@@ -87,30 +89,93 @@ private object ToolPkgMessageProcessingBridgePlugin : MessageProcessingPlugin {
     override suspend fun createExecutionIfMatched(
         params: MessageProcessingHookParams
     ): MessageProcessingExecution? {
+        val totalStartTime = messageTimingNow()
         val manager = packageManager(params.context)
+        val loadHooksStartTime = messageTimingNow()
         val hooks =
             withContext(Dispatchers.IO) {
                 manager.getToolPkgMessageProcessingPlugins()
             }
+        logMessageTiming(
+            stage = "toolpkg.messageProcessing.loadHooks",
+            startTimeMs = loadHooksStartTime,
+            details = "hooks=${hooks.size}"
+        )
+
+        val buildPayloadStartTime = messageTimingNow()
         val baseEventPayload = buildMessageEventPayload(params = params, probeOnly = false)
-        for (hook in hooks) {
+        val probeEventPayload = buildMessageEventPayload(params = params, probeOnly = true)
+        logMessageTiming(
+            stage = "toolpkg.messageProcessing.buildPayload",
+            startTimeMs = buildPayloadStartTime,
+            details = "history=${params.chatHistory.size}, messageLength=${params.messageContent.length}"
+        )
+
+        for ((index, hook) in hooks.withIndex()) {
+            val hookProbeStartTime = messageTimingNow()
+            val hookKey = "${hook.containerPackageName}:${hook.pluginId}"
             val probeDecoded =
                 runMessageProcessingHook(
                     manager = manager,
                     hook = hook,
-                    eventPayload = buildMessageEventPayload(params = params, probeOnly = true)
-                ) ?: continue
-            val probeResult = parseMessageProcessingResult(probeDecoded) ?: continue
-            if (!probeResult.matched) {
+                    eventPayload = probeEventPayload
+                )
+            if (probeDecoded == null) {
+                logMessageTiming(
+                    stage = "toolpkg.messageProcessing.probeHook",
+                    startTimeMs = hookProbeStartTime,
+                    details = "index=$index, hook=$hookKey, matched=false, decoded=null"
+                )
                 continue
             }
-            return createStreamingExecution(
+
+            val parseProbeResultStartTime = messageTimingNow()
+            val probeResult = parseMessageProcessingResult(probeDecoded)
+            logMessageTiming(
+                stage = "toolpkg.messageProcessing.parseProbeResult",
+                startTimeMs = parseProbeResultStartTime,
+                details = "index=$index, hook=$hookKey, matched=${probeResult?.matched == true}, chunks=${probeResult?.chunks?.size ?: 0}"
+            )
+            if (probeResult == null || !probeResult.matched) {
+                logMessageTiming(
+                    stage = "toolpkg.messageProcessing.probeHook",
+                    startTimeMs = hookProbeStartTime,
+                    details = "index=$index, hook=$hookKey, matched=false"
+                )
+                continue
+            }
+
+            logMessageTiming(
+                stage = "toolpkg.messageProcessing.probeHook",
+                startTimeMs = hookProbeStartTime,
+                details = "index=$index, hook=$hookKey, matched=true, chunks=${probeResult.chunks.size}"
+            )
+
+            val createExecutionStartTime = messageTimingNow()
+            val execution = createStreamingExecution(
                 manager = manager,
                 hook = hook,
                 eventPayload = baseEventPayload,
                 executionId = nextMessageProcessingExecutionId(hook)
             )
+            logMessageTiming(
+                stage = "toolpkg.messageProcessing.createExecution",
+                startTimeMs = createExecutionStartTime,
+                details = "index=$index, hook=$hookKey"
+            )
+            logMessageTiming(
+                stage = "toolpkg.messageProcessing.matchTotal",
+                startTimeMs = totalStartTime,
+                details = "hooks=${hooks.size}, matchedHook=$hookKey, index=$index"
+            )
+            return execution
         }
+
+        logMessageTiming(
+            stage = "toolpkg.messageProcessing.matchTotal",
+            startTimeMs = totalStartTime,
+            details = "hooks=${hooks.size}, matchedHook=none"
+        )
         return null
     }
 
@@ -134,6 +199,11 @@ private object ToolPkgMessageProcessingBridgePlugin : MessageProcessingPlugin {
         eventPayload: Map<String, Any?>,
         onIntermediateResult: ((Any?) -> Unit)? = null
     ): Any? {
+        val totalStartTime = messageTimingNow()
+        val hookKey = "${hook.containerPackageName}:${hook.pluginId}"
+        val isProbeOnly = eventPayload["probeOnly"] == true
+
+        val runMainHookStartTime = messageTimingNow()
         val result =
             withContext(Dispatchers.IO) {
                 manager.runToolPkgMainHook(
@@ -145,6 +215,12 @@ private object ToolPkgMessageProcessingBridgePlugin : MessageProcessingPlugin {
                     onIntermediateResult = onIntermediateResult
                 )
             }
+        logMessageTiming(
+            stage = "toolpkg.messageProcessing.runMainHook",
+            startTimeMs = runMainHookStartTime,
+            details = "hook=$hookKey, probeOnly=$isProbeOnly, success=${result.isSuccess}"
+        )
+
         val value =
             result.getOrElse { error ->
                 AppLogger.e(
@@ -152,18 +228,39 @@ private object ToolPkgMessageProcessingBridgePlugin : MessageProcessingPlugin {
                     "ToolPkg message processing hook failed: ${hook.containerPackageName}:${hook.pluginId}",
                     error
                 )
-                return null
-            } ?: return null
-
-        return runCatching { decodeHookResult(value) }
-            .getOrElse { error ->
-                AppLogger.e(
-                    TAG,
-                    "ToolPkg message processing hook decode failed: ${hook.containerPackageName}:${hook.pluginId}",
-                    error
-                )
                 null
             }
+        if (value == null) {
+            logMessageTiming(
+                stage = "toolpkg.messageProcessing.hookTotal",
+                startTimeMs = totalStartTime,
+                details = "hook=$hookKey, probeOnly=$isProbeOnly, decoded=false"
+            )
+            return null
+        }
+
+        val decodeHookResultStartTime = messageTimingNow()
+        val decoded =
+            runCatching { decodeHookResult(value) }
+                .getOrElse { error ->
+                    AppLogger.e(
+                        TAG,
+                        "ToolPkg message processing hook decode failed: ${hook.containerPackageName}:${hook.pluginId}",
+                        error
+                    )
+                    null
+                }
+        logMessageTiming(
+            stage = "toolpkg.messageProcessing.decodeHookResult",
+            startTimeMs = decodeHookResultStartTime,
+            details = "hook=$hookKey, probeOnly=$isProbeOnly, decoded=${decoded != null}, valueType=${value::class.java.simpleName}"
+        )
+        logMessageTiming(
+            stage = "toolpkg.messageProcessing.hookTotal",
+            startTimeMs = totalStartTime,
+            details = "hook=$hookKey, probeOnly=$isProbeOnly, decoded=${decoded != null}"
+        )
+        return decoded
     }
 
     private fun nextMessageProcessingExecutionId(

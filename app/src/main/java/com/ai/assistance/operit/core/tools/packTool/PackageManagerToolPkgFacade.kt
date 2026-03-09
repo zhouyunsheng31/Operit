@@ -1,6 +1,8 @@
 package com.ai.assistance.operit.core.tools.packTool
 
 import android.content.Context
+import com.ai.assistance.operit.core.chat.logMessageTiming
+import com.ai.assistance.operit.core.chat.messageTimingNow
 import com.ai.assistance.operit.util.AppLogger
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -710,35 +712,56 @@ internal class PackageManagerToolPkgFacade(
         eventPayload: Map<String, Any?> = emptyMap(),
         onIntermediateResult: ((Any?) -> Unit)? = null
     ): Result<Any?> {
+        val normalizedPluginId = pluginId?.trim().orEmpty().ifBlank { null }
+        val resolvedEventName = eventName?.trim().orEmpty().ifBlank { event }
+        val shouldLogTiming = event.equals(TOOLPKG_EVENT_MESSAGE_PROCESSING, ignoreCase = true)
+        val totalStartTime = if (shouldLogTiming) messageTimingNow() else 0L
+
         return runCatching {
-            val normalizedPluginId = pluginId?.trim().orEmpty().ifBlank { null }
-            val resolvedEventName = eventName?.trim().orEmpty().ifBlank { event }
             val normalizedContainerPackageName = packageManager.normalizePackageName(containerPackageName)
             val runtime =
                 packageManager.toolPkgContainersInternal[normalizedContainerPackageName]
                     ?: throw IllegalArgumentException("ToolPkg container not found: $containerPackageName")
+
+            val getMainScriptStartTime = if (shouldLogTiming) messageTimingNow() else 0L
             val script =
                 packageManager.getToolPkgMainScriptInternal(runtime.packageName)
                     ?: throw IllegalStateException("ToolPkg main script is unavailable: ${runtime.packageName}")
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.runMainHook.getMainScript",
+                    startTimeMs = getMainScriptStartTime,
+                    details = "container=${runtime.packageName}, plugin=${normalizedPluginId ?: "none"}, scriptLength=${script.length}"
+                )
+            }
+
+            val resolveFunctionSourceStartTime = if (shouldLogTiming) messageTimingNow() else 0L
             val functionSource =
                 resolveToolPkgFunctionSource(
                     runtime = runtime,
                     functionName = functionName,
                     event = event
                 )
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.runMainHook.resolveFunctionSource",
+                    startTimeMs = resolveFunctionSourceStartTime,
+                    details = "container=${runtime.packageName}, function=$functionName, hasInline=${!functionSource.isNullOrBlank()}"
+                )
+            }
 
             val timestampMs = System.currentTimeMillis()
-        val params = mutableMapOf<String, Any?>(
-            "event" to resolvedEventName,
-            "eventName" to resolvedEventName,
-            "eventPayload" to eventPayload,
-            "timestampMs" to timestampMs,
-            "functionName" to functionName,
-            "toolPkgId" to runtime.packageName,
-            "containerPackageName" to runtime.packageName,
-            "__operit_ui_package_name" to runtime.packageName,
-            "__operit_script_screen" to runtime.mainEntry
-        )
+            val params = mutableMapOf<String, Any?>(
+                "event" to resolvedEventName,
+                "eventName" to resolvedEventName,
+                "eventPayload" to eventPayload,
+                "timestampMs" to timestampMs,
+                "functionName" to functionName,
+                "toolPkgId" to runtime.packageName,
+                "containerPackageName" to runtime.packageName,
+                "__operit_ui_package_name" to runtime.packageName,
+                "__operit_script_screen" to runtime.mainEntry
+            )
             if (!normalizedPluginId.isNullOrBlank()) {
                 params["pluginId"] = normalizedPluginId
             }
@@ -746,16 +769,46 @@ internal class PackageManagerToolPkgFacade(
                 params["__operit_inline_function_name"] = functionName
                 params["__operit_inline_function_source"] = functionSource
             }
+
+            val getExecutionEngineStartTime = if (shouldLogTiming) messageTimingNow() else 0L
             val executionContextKey = resolveToolPkgExecutionContextKey(runtime.packageName, params)
             val executionEngine = packageManager.getToolPkgExecutionEngine(executionContextKey)
-            executionEngine.executeScriptFunction(
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.runMainHook.getExecutionEngine",
+                    startTimeMs = getExecutionEngineStartTime,
+                    details = "container=${runtime.packageName}, plugin=${normalizedPluginId ?: "none"}, contextKey=$executionContextKey"
+                )
+            }
+
+            val executeScriptFunctionStartTime = if (shouldLogTiming) messageTimingNow() else 0L
+            val executionResult = executionEngine.executeScriptFunction(
                 script = script,
                 functionName = functionName,
                 params = params,
                 onIntermediateResult = onIntermediateResult
             )
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.runMainHook.executeScriptFunction",
+                    startTimeMs = executeScriptFunctionStartTime,
+                    details = "container=${runtime.packageName}, plugin=${normalizedPluginId ?: "none"}, function=$functionName, resultType=${executionResult?.javaClass?.simpleName ?: "null"}"
+                )
+                logMessageTiming(
+                    stage = "toolpkg.runMainHook.total",
+                    startTimeMs = totalStartTime,
+                    details = "container=${runtime.packageName}, plugin=${normalizedPluginId ?: "none"}, function=$functionName, success=true"
+                )
+            }
+            executionResult
         }.onFailure { error ->
-            val normalizedPluginId = pluginId?.trim().orEmpty().ifBlank { null }
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.runMainHook.total",
+                    startTimeMs = totalStartTime,
+                    details = "container=$containerPackageName, plugin=${normalizedPluginId ?: "none"}, function=$functionName, success=false, reason=${error.message ?: error.javaClass.simpleName}"
+                )
+            }
             val pluginPart = if (normalizedPluginId.isNullOrBlank()) "" else ", plugin=$normalizedPluginId"
             AppLogger.e(
                 "PackageManagerToolPkgFacade",

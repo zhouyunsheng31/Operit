@@ -82,7 +82,7 @@
 
 ### 2.5 必改：TypeScript 类型定义（对脚本作者的契约）
 
-- **文件**：`examples/types/*.d.ts`（尤其是 `examples/types/files.d.ts`、`examples/types/chat.d.ts`、`examples/types/core.d.ts` 等）
+- **文件**：`examples/types/*.d.ts`（尤其是 `examples/types/files.d.ts`、`examples/types/chat.d.ts`、`examples/types/core.d.ts`、`examples/types/system.d.ts` 等）
 - **你要做的事**：
   - 更新函数签名与参数类型
   - 如果新增了枚举/联合类型（如 `"replace" | "delete" | "create"`），补充 type 定义
@@ -197,6 +197,6 @@
 - `ToolRegistration.kt`：注册执行器
 - `Standard*Tools.kt`：实现逻辑
 - `JsTools.kt`：暴露给脚本侧（如需要）
-- `examples/types/*.d.ts`：类型定义（如需要）
+- `examples/types/*.d.ts`：类型定义（如需要，`Tools.System.*` 记得同步 `examples/types/system.d.ts`）
 - `docs/`：补文档
 

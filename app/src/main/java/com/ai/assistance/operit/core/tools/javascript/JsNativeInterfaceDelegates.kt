@@ -133,21 +133,40 @@ internal object JsNativeInterfaceDelegates {
         )
     }
 
-    fun setEnv(context: Context, key: String, value: String?) {
-        try {
-            val name = key.trim()
-            if (name.isEmpty()) {
-                return
-            }
-            val normalized = value?.trim().orEmpty()
-            val envPreferences = EnvPreferences.getInstance(context)
-            if (normalized.isBlank()) {
-                envPreferences.removeEnv(name)
-            } else {
-                envPreferences.setEnv(name, normalized)
-            }
+    private inline fun <T> guard(
+        fallback: T,
+        failureMessage: String,
+        block: () -> T
+    ): T {
+        return try {
+            block()
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error writing environment variable from JS: $key", e)
+            AppLogger.e(TAG, failureMessage, e)
+            fallback
+        }
+    }
+
+    private fun normalizeNonBlank(value: String): String? {
+        return value.trim().takeIf { it.isNotBlank() }
+    }
+
+    private fun applyEnvValue(
+        preferences: EnvPreferences,
+        key: String,
+        value: String?
+    ) {
+        val normalizedKey = normalizeNonBlank(key) ?: return
+        val normalizedValue = value?.trim().orEmpty()
+        if (normalizedValue.isBlank()) {
+            preferences.removeEnv(normalizedKey)
+        } else {
+            preferences.setEnv(normalizedKey, normalizedValue)
+        }
+    }
+
+    fun setEnv(context: Context, key: String, value: String?) {
+        guard(Unit, "Error writing environment variable from JS: $key") {
+            applyEnvValue(EnvPreferences.getInstance(context), key, value)
         }
     }
 
@@ -156,113 +175,60 @@ internal object JsNativeInterfaceDelegates {
         key: String,
         envOverrides: Map<String, String>
     ): String {
-        return try {
-            val name = key.trim()
-            if (name.isEmpty()) {
-                ""
-            } else {
-                val overridden = envOverrides[name]
-                if (!overridden.isNullOrEmpty()) {
-                    overridden
-                } else {
-                    EnvPreferences.getInstance(context).getEnv(name) ?: ""
-                }
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error reading environment variable from JS: $key", e)
-            ""
+        return guard("", "Error reading environment variable from JS: $key") {
+            val normalizedKey = normalizeNonBlank(key) ?: return@guard ""
+            envOverrides[normalizedKey]?.takeIf { it.isNotEmpty() }
+                ?: EnvPreferences.getInstance(context).getEnv(normalizedKey)
+                ?: ""
         }
     }
 
     fun setEnvs(context: Context, valuesJson: String) {
-        try {
+        guard(Unit, "Error batch-writing environment variables from JS") {
             if (valuesJson.isBlank()) {
-                return
+                return@guard
             }
             val payload = JSONObject(valuesJson)
-            val envPreferences = EnvPreferences.getInstance(context)
+            val preferences = EnvPreferences.getInstance(context)
             payload.keys().forEach { rawKey ->
-                val key = rawKey.trim()
-                if (key.isEmpty()) {
-                    return@forEach
-                }
-                val normalized = payload.opt(rawKey)?.toString()?.trim().orEmpty()
-                if (normalized.isBlank()) {
-                    envPreferences.removeEnv(key)
-                } else {
-                    envPreferences.setEnv(key, normalized)
-                }
+                applyEnvValue(preferences, rawKey, payload.opt(rawKey)?.toString())
             }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error batch-writing environment variables from JS", e)
         }
     }
 
     fun isPackageImported(packageManager: PackageManager, packageName: String): Boolean {
-        return try {
-            val name = packageName.trim()
-            if (name.isBlank()) {
-                false
-            } else {
-                packageManager.isPackageImported(name)
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error checking package imported from JS: $packageName", e)
-            false
+        return guard(false, "Error checking package imported from JS: $packageName") {
+            normalizeNonBlank(packageName)?.let(packageManager::isPackageImported) ?: false
         }
     }
 
     fun importPackage(packageManager: PackageManager, packageName: String): String {
-        return try {
-            val name = packageName.trim()
-            if (name.isBlank()) {
-                "Package name is required"
-            } else {
-                packageManager.importPackage(name)
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error importing package from JS: $packageName", e)
-            "Error: ${e.message}"
+        return guard("Error: package import failed", "Error importing package from JS: $packageName") {
+            val normalized = normalizeNonBlank(packageName) ?: return@guard "Package name is required"
+            packageManager.importPackage(normalized)
         }
     }
 
     fun removePackage(packageManager: PackageManager, packageName: String): String {
-        return try {
-            val name = packageName.trim()
-            if (name.isBlank()) {
-                "Package name is required"
-            } else {
-                packageManager.removePackage(name)
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error removing package from JS: $packageName", e)
-            "Error: ${e.message}"
+        return guard("Error: package removal failed", "Error removing package from JS: $packageName") {
+            val normalized = normalizeNonBlank(packageName) ?: return@guard "Package name is required"
+            packageManager.removePackage(normalized)
         }
     }
 
     fun usePackage(packageManager: PackageManager, packageName: String): String {
-        return try {
-            val name = packageName.trim()
-            if (name.isBlank()) {
-                "Package name is required"
-            } else {
-                packageManager.usePackage(name)
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error using package from JS: $packageName", e)
-            "Error: ${e.message}"
+        return guard("Error: package activation failed", "Error using package from JS: $packageName") {
+            val normalized = normalizeNonBlank(packageName) ?: return@guard "Package name is required"
+            packageManager.usePackage(normalized)
         }
     }
 
     fun listImportedPackagesJson(packageManager: PackageManager): String {
-        return try {
+        return guard("[]", "Error listing imported packages from JS") {
             Json.encodeToString(
                 ListSerializer(String.serializer()),
                 packageManager.getImportedPackages()
             )
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error listing imported packages from JS", e)
-            "[]"
         }
     }
 
@@ -273,46 +239,34 @@ internal object JsNativeInterfaceDelegates {
         toolName: String,
         preferImported: String
     ): String {
-        return try {
-            val normalizedTool = toolName.trim()
-            if (normalizedTool.isBlank()) {
-                return ""
-            }
+        return guard(
+            fallback = toolName.trim(),
+            failureMessage = "Error resolving tool name from JS: package=$packageName, subpackage=$subpackageId, tool=$toolName"
+        ) {
+            val normalizedTool = normalizeNonBlank(toolName) ?: return@guard ""
             if (normalizedTool.contains(":")) {
-                return normalizedTool
+                return@guard normalizedTool
             }
 
             val preferImportedBool = !preferImported.equals("false", ignoreCase = true)
-            val packageCandidate = packageName.trim()
-            val subpackageCandidate = subpackageId.trim()
-
             val resolvedPackageName =
-                when {
-                    packageCandidate.isNotBlank() ->
-                        packageManager.findPreferredPackageNameForSubpackageId(
-                            packageCandidate,
-                            preferImported = preferImportedBool
-                        ) ?: packageCandidate
-                    subpackageCandidate.isNotBlank() ->
-                        packageManager.findPreferredPackageNameForSubpackageId(
-                            subpackageCandidate,
-                            preferImported = preferImportedBool
-                        ) ?: subpackageCandidate
-                    else -> ""
-                }
+                normalizeNonBlank(packageName)?.let { candidate ->
+                    packageManager.findPreferredPackageNameForSubpackageId(
+                        candidate,
+                        preferImported = preferImportedBool
+                    ) ?: candidate
+                } ?: normalizeNonBlank(subpackageId)?.let { candidate ->
+                    packageManager.findPreferredPackageNameForSubpackageId(
+                        candidate,
+                        preferImported = preferImportedBool
+                    ) ?: candidate
+                }.orEmpty()
 
             if (resolvedPackageName.isBlank()) {
                 normalizedTool
             } else {
                 "$resolvedPackageName:$normalizedTool"
             }
-        } catch (e: Exception) {
-            AppLogger.e(
-                TAG,
-                "Error resolving tool name from JS: package=$packageName, subpackage=$subpackageId, tool=$toolName",
-                e
-            )
-            toolName.trim()
         }
     }
 
@@ -322,32 +276,22 @@ internal object JsNativeInterfaceDelegates {
         resourceKey: String,
         outputFileName: String
     ): String {
-        return try {
-            val target = packageNameOrSubpackageId.trim()
-            val key = resourceKey.trim()
-            if (target.isBlank() || key.isBlank()) {
-                return ""
-            }
+        return guard(
+            fallback = "",
+            failureMessage = "Error reading toolpkg resource from JS: package/subpackage=$packageNameOrSubpackageId, resource=$resourceKey"
+        ) {
+            val target = normalizeNonBlank(packageNameOrSubpackageId) ?: return@guard ""
+            val key = normalizeNonBlank(resourceKey) ?: return@guard ""
+            val fileName = normalizeNonBlank(outputFileName)
+                ?: packageManager.getToolPkgResourceOutputFileName(
+                    packageNameOrSubpackageId = target,
+                    resourceKey = key,
+                    preferImportedContainer = true
+                )
+                ?: "$key.bin"
+            val safeName = fileName.substringAfterLast('/').substringAfterLast('\\').ifBlank { "$key.bin" }
 
-            val rawName =
-                if (outputFileName.trim().isBlank()) {
-                    packageManager.getToolPkgResourceOutputFileName(
-                        packageNameOrSubpackageId = target,
-                        resourceKey = key,
-                        preferImportedContainer = true
-                    ) ?: "$key.bin"
-                } else {
-                    outputFileName.trim()
-                }
-            val safeName =
-                rawName.substringAfterLast('/').substringAfterLast('\\').ifBlank { "$key.bin" }
-
-            val exportDir = OperitPaths.cleanOnExitDir()
-            if (!exportDir.exists()) {
-                exportDir.mkdirs()
-            }
-            val outputFile = File(exportDir, safeName)
-
+            val outputFile = File(OperitPaths.cleanOnExitDir().apply { mkdirs() }, safeName)
             val copied =
                 packageManager.copyToolPkgResourceToFile(target, key, outputFile) ||
                     packageManager.copyToolPkgResourceToFileBySubpackageId(
@@ -356,18 +300,7 @@ internal object JsNativeInterfaceDelegates {
                         destinationFile = outputFile,
                         preferImportedContainer = true
                     )
-            if (!copied) {
-                ""
-            } else {
-                outputFile.absolutePath
-            }
-        } catch (e: Exception) {
-            AppLogger.e(
-                TAG,
-                "Error reading toolpkg resource from JS: package/subpackage=$packageNameOrSubpackageId, resource=$resourceKey",
-                e
-            )
-            ""
+            if (copied) outputFile.absolutePath else ""
         }
     }
 
@@ -376,23 +309,16 @@ internal object JsNativeInterfaceDelegates {
         packageNameOrSubpackageId: String,
         resourcePath: String
     ): String {
-        return try {
-            val target = packageNameOrSubpackageId.trim()
-            val path = resourcePath.trim()
-            if (target.isBlank() || path.isBlank()) {
-                return ""
-            }
+        return guard(
+            fallback = "",
+            failureMessage = "Error reading toolpkg text resource from JS: package/subpackage=$packageNameOrSubpackageId, path=$resourcePath"
+        ) {
+            val target = normalizeNonBlank(packageNameOrSubpackageId) ?: return@guard ""
+            val path = normalizeNonBlank(resourcePath) ?: return@guard ""
             packageManager.readToolPkgTextResource(
                 packageNameOrSubpackageId = target,
                 resourcePath = path
             ) ?: ""
-        } catch (e: Exception) {
-            AppLogger.e(
-                TAG,
-                "Error reading toolpkg text resource from JS: package/subpackage=$packageNameOrSubpackageId, path=$resourcePath",
-                e
-            )
-            ""
         }
     }
 

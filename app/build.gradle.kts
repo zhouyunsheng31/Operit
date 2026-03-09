@@ -184,6 +184,7 @@ dependencies {
     implementation(project(":llama"))
     implementation(project(":mmd"))
     implementation(project(":showerclient"))
+    implementation(project(":quickjs"))
 
     // glTF runtime rendering (Filament)
     implementation("com.google.android.filament:filament-android:1.69.2")

@@ -340,6 +340,21 @@ type LocalizedText = string | { [lang: string]: string }
 - `registerSystemPromptComposeHook(definition)`
 - `registerToolPromptComposeHook(definition)`
 - `registerPromptFinalizeHook(definition)`
+- `readResource(key, outputFileName?)`
+
+### `ToolPkg.readResource(...)`
+
+把当前 toolpkg `manifest.resources` 里声明的资源按 `key` 释放到宿主临时目录，并返回落盘后的绝对路径。
+
+```ts
+const jarPath = await ToolPkg.readResource('apktool_lib_jar', 'apktool-lib.jar');
+```
+
+说明：
+
+- 这个方法不依赖 `compose_dsl` 的 `ctx`，普通子包工具函数、主入口 hook、UI 模块都可以直接调用。
+- `key` 对应 `manifest.json` 里的 `resources[].key`。
+- `outputFileName` 可选；不传时会使用清单资源原始文件名。
 
 ## 示例
 

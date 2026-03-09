@@ -2,6 +2,7 @@ package com.ai.assistance.operit.core.chat
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.SystemClock
 import com.ai.assistance.operit.R
 import com.ai.assistance.operit.util.AppLogger
 import com.ai.assistance.operit.api.chat.EnhancedAIService
@@ -31,6 +32,20 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
+
+internal const val MESSAGE_PROCESS_TIMING_TAG = "MessageProcessTiming"
+
+internal fun messageTimingNow(): Long = SystemClock.elapsedRealtime()
+
+internal fun logMessageTiming(
+    stage: String,
+    startTimeMs: Long,
+    details: String? = null
+) {
+    val elapsed = SystemClock.elapsedRealtime() - startTimeMs
+    val suffix = details?.takeIf { it.isNotBlank() }?.let { ", $it" } ?: ""
+    AppLogger.d(MESSAGE_PROCESS_TIMING_TAG, "$stage 耗时=${elapsed}ms$suffix")
+}
 
 /**
  * 单例对象，负责管理与 EnhancedAIService 的所有通信。
@@ -99,6 +114,7 @@ object AIMessageManager {
         enableDirectAudioProcessing: Boolean = false,
         enableDirectVideoProcessing: Boolean = false
     ): String {
+        val totalStartTime = messageTimingNow()
         val proxySenderTag =
             if (!proxySenderName.isNullOrBlank() &&
                 !messageText.contains("<proxy_sender", ignoreCase = true)
@@ -110,6 +126,7 @@ object AIMessageManager {
             }
 
         // 1. 构建回复标签（如果有回复消息）
+        val replyTagStartTime = messageTimingNow()
         val replyTag = replyToMessage?.let { message ->
             val cleanContent = message.content
                 .replace(Regex("<[^>]*>"), "") // 移除XML标签
@@ -120,8 +137,14 @@ object AIMessageManager {
             val instruction = context.getString(R.string.ai_message_replying_to_previous)
             "<reply_to sender=\"${roleName}\" timestamp=\"${message.timestamp}\">${instruction}\"${cleanContent}\"</reply_to>"
         } ?: ""
+        logMessageTiming(
+            stage = "buildUserMessageContent.replyTag",
+            startTimeMs = replyTagStartTime,
+            details = "hasReply=${replyToMessage != null}, length=${replyTag.length}"
+        )
 
         // 3. 根据开关决定是否生成工作区附着
+        val workspaceTagStartTime = messageTimingNow()
         val workspaceTag = if (enableWorkspaceAttachment && !workspacePath.isNullOrBlank() && !messageText.contains("<workspace_attachment>", ignoreCase = true)) {
             try {
                 val workspaceContent = WorkspaceAttachmentProcessor.generateWorkspaceAttachment(
@@ -135,8 +158,14 @@ object AIMessageManager {
                 ""
             }
         } else ""
+        logMessageTiming(
+            stage = "buildUserMessageContent.workspaceTag",
+            startTimeMs = workspaceTagStartTime,
+            details = "enabled=$enableWorkspaceAttachment, hasWorkspace=${!workspacePath.isNullOrBlank()}, length=${workspaceTag.length}"
+        )
 
         // 4. 构建附件标签
+        val attachmentTagsStartTime = messageTimingNow()
         val attachmentTags = if (attachments.isNotEmpty()) {
             attachments.joinToString(" ") { attachment ->
                 // 如果启用直接图片处理且附件是图片，转换为link标签
@@ -209,11 +238,22 @@ object AIMessageManager {
                 }
             }
         } else ""
+        logMessageTiming(
+            stage = "buildUserMessageContent.attachmentTags",
+            startTimeMs = attachmentTagsStartTime,
+            details = "attachments=${attachments.size}, length=${attachmentTags.length}, directImage=$enableDirectImageProcessing, directAudio=$enableDirectAudioProcessing, directVideo=$enableDirectVideoProcessing"
+        )
 
         // 5. 组合最终消息
-        return listOf(proxySenderTag, messageText, attachmentTags, workspaceTag, replyTag)
+        val finalMessageContent = listOf(proxySenderTag, messageText, attachmentTags, workspaceTag, replyTag)
             .filter { it.isNotBlank() }
             .joinToString(" ")
+        logMessageTiming(
+            stage = "buildUserMessageContent.total",
+            startTimeMs = totalStartTime,
+            details = "messageLength=${messageText.length}, finalLength=${finalMessageContent.length}, attachments=${attachments.size}"
+        )
+        return finalMessageContent
     }
 
     /**
@@ -262,15 +302,22 @@ object AIMessageManager {
         chatModelConfigIdOverride: String? = null,
         chatModelIndexOverride: Int? = null
     ): SharedStream<String> {
+        val totalStartTime = messageTimingNow()
         val chatKey = chatId ?: DEFAULT_CHAT_KEY
         lastActiveChatKey = chatKey
         activeEnhancedAiServiceByChatId[chatKey] = enhancedAiService
 
+        val buildMemoryStartTime = messageTimingNow()
         val memory = getMemoryFromMessages(
             messages = chatHistory,
             splitByRole = splitHistoryByRole,
             targetRoleName = currentRoleName,
             groupOrchestrationMode = groupOrchestrationMode
+        )
+        logMessageTiming(
+            stage = "sendMessage.buildMemory",
+            startTimeMs = buildMemoryStartTime,
+            details = "chatKey=$chatKey, source=${chatHistory.size}, result=${memory.size}, splitByRole=$splitHistoryByRole, groupOrchestration=$groupOrchestrationMode"
         )
         if (splitHistoryByRole && !currentRoleName.isNullOrBlank()) {
             val assistantCount = memory.count { it.first == "assistant" }
@@ -282,6 +329,7 @@ object AIMessageManager {
         }
 
         return withContext(Dispatchers.IO) {
+            val limitHistoryStartTime = messageTimingNow()
             val maxImageHistoryUserTurns = apiPreferences.maxImageHistoryUserTurnsFlow.first()
             val maxMediaHistoryUserTurns = apiPreferences.maxMediaHistoryUserTurnsFlow.first()
 
@@ -304,7 +352,13 @@ object AIMessageManager {
                     "历史音视频裁剪生效: limit=$maxMediaHistoryUserTurns, before=$beforeMediaLinkCount, after=$afterMediaLinkCount"
                 )
             }
+            logMessageTiming(
+                stage = "sendMessage.limitHistory",
+                startTimeMs = limitHistoryStartTime,
+                details = "chatKey=$chatKey, before=${memory.size}, after=${memoryForRequest.size}, imageLimit=$maxImageHistoryUserTurns, mediaLimit=$maxMediaHistoryUserTurns"
+            )
 
+            val matchPluginStartTime = messageTimingNow()
             val pluginExecution = MessageProcessingPluginRegistry.createExecutionIfMatched(
                 params = MessageProcessingHookParams(
                     context = context,
@@ -317,27 +371,45 @@ object AIMessageManager {
                     onNonFatalError = onNonFatalError
                 )
             )
+            logMessageTiming(
+                stage = "sendMessage.matchPlugin",
+                startTimeMs = matchPluginStartTime,
+                details = "chatKey=$chatKey, matched=${pluginExecution != null}"
+            )
             if (pluginExecution != null) {
                 activeMessageProcessingControllerByChatId[chatKey] = pluginExecution.controller
                 AppLogger.d(TAG, "消息处理插件已接管消息处理")
-                return@withContext pluginExecution.stream.share(
+                val pluginStream = pluginExecution.stream.share(
                     scope = scope,
                     onComplete = {
                         activeMessageProcessingControllerByChatId.remove(chatKey)
                         activeEnhancedAiServiceByChatId.remove(chatKey)
                     }
                 )
+                logMessageTiming(
+                    stage = "sendMessage.total",
+                    startTimeMs = totalStartTime,
+                    details = "chatKey=$chatKey, mode=plugin, history=${memoryForRequest.size}"
+                )
+                return@withContext pluginStream
             } else {
                 activeMessageProcessingControllerByChatId.remove(chatKey)
                 AppLogger.d(TAG, "消息处理插件未接管，使用普通模式")
             }
 
             // 获取流式输出设置
+            val readStreamSettingStartTime = messageTimingNow()
             val disableStreamOutput = apiPreferences.disableStreamOutputFlow.first()
             val enableStream = !disableStreamOutput
+            logMessageTiming(
+                stage = "sendMessage.readStreamSetting",
+                startTimeMs = readStreamSettingStartTime,
+                details = "chatKey=$chatKey, enableStream=$enableStream"
+            )
 
             // 使用普通模式
-            enhancedAiService.sendMessage(
+            val prepareRequestStartTime = messageTimingNow()
+            val responseStream = enhancedAiService.sendMessage(
                 message = messageContent,
                 chatId = chatId,
                 chatHistory = memoryForRequest, // Correct parameter name is chatHistory
@@ -366,6 +438,17 @@ object AIMessageManager {
                     activeEnhancedAiServiceByChatId.remove(chatKey)
                 }
             )
+            logMessageTiming(
+                stage = "sendMessage.prepareRequest",
+                startTimeMs = prepareRequestStartTime,
+                details = "chatKey=$chatKey, history=${memoryForRequest.size}, stream=$enableStream, prompt=$promptFunctionType"
+            )
+            logMessageTiming(
+                stage = "sendMessage.total",
+                startTimeMs = totalStartTime,
+                details = "chatKey=$chatKey, mode=default, history=${memoryForRequest.size}"
+            )
+            responseStream
         }
     }
 
@@ -823,6 +906,7 @@ object AIMessageManager {
         targetRoleName: String? = null,
         groupOrchestrationMode: Boolean = false
     ): List<Pair<String, String>> {
+        val totalStartTime = messageTimingNow()
         // 1. 找到最后一条总结消息，只处理总结之后的消息
         val lastSummaryIndex = messages.indexOfLast { it.sender == "summary" }
         val relevantMessages = if (lastSummaryIndex != -1) {
@@ -842,7 +926,7 @@ object AIMessageManager {
         }
 
         // 4. 处理每条消息
-        return relevantMessages
+        val processedMessages = relevantMessages
             .filter { it.sender == "user" || it.sender == "ai" || it.sender == "summary" }
             .mapNotNull { message ->
                 when (message.sender) {
@@ -861,6 +945,14 @@ object AIMessageManager {
                     else -> null
                 }
             }
+        val assistantCount = processedMessages.count { it.first == "assistant" }
+        val userCount = processedMessages.count { it.first == "user" }
+        logMessageTiming(
+            stage = "getMemoryFromMessages.total",
+            startTimeMs = totalStartTime,
+            details = "source=${messages.size}, relevant=${relevantMessages.size}, result=${processedMessages.size}, assistant=$assistantCount, user=$userCount, splitByRole=$splitByRole, roleScoped=$isRoleScopedMode, groupOrchestration=$groupOrchestrationMode"
+        )
+        return processedMessages
     }
 
     private fun processAiMessage(

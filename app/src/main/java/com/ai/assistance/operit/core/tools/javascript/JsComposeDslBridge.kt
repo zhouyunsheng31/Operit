@@ -382,27 +382,6 @@ internal fun buildComposeDslContextBridgeDefinition(): String {
                         invokeNative('setEnvs', [JSON.stringify(payload)]);
                         return Promise.resolve();
                     },
-                    readResource: function(key) {
-                        var resourceKey = String(key || '').trim();
-                        if (!resourceKey) {
-                            return Promise.reject(new Error('resource key is required'));
-                        }
-                        var resourceTarget = String(runtime.packageName || runtime.toolPkgId || '').trim();
-                        if (!resourceTarget) {
-                            return Promise.reject(new Error('package/toolpkg runtime target is empty'));
-                        }
-                        var filePath = invokeNative('readToolPkgResource', [
-                            resourceTarget,
-                            resourceKey,
-                            ''
-                        ]);
-                        if (typeof filePath === 'string' && filePath.trim()) {
-                            return Promise.resolve(filePath);
-                        }
-                        return Promise.reject(
-                            new Error('resource not found: ' + resourceKey)
-                        );
-                    },
                     navigate: function(route, args) {
                         return Promise.resolve();
                     },
@@ -522,6 +501,11 @@ internal fun buildComposeDslContextBridgeDefinition(): String {
                     ctx: ctx,
                     state: runtime.stateStore,
                     memo: runtime.memoStore,
+                    setCallRuntime: function(nextCallRuntime) {
+                        if (nextCallRuntime && typeof nextCallRuntime === 'object') {
+                            runtime.callRuntime = nextCallRuntime;
+                        }
+                    },
                     invokeAction: function(actionId, payload) {
                         var id = String(actionId || '').trim();
                         if (!id) {

@@ -22,3 +22,6 @@
 [submodule "app/src/main/cpp/thirdparty/sherpa-ncnn"]
 	path = app/src/main/cpp/thirdparty/sherpa-ncnn
 	url = https://github.com/k2-fsa/sherpa-ncnn.git
+[submodule "thirdparty/quickjs"]
+	path = thirdparty/quickjs
+	url = https://github.com/bellard/quickjs.git

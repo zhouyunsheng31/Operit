@@ -13,6 +13,10 @@ const EnhancedAIService = Java.com.ai.assistance.operit.api.chat.EnhancedAIServi
 const MessageProcessingController = Java.com.ai.assistance.operit.core.chat.plugins.MessageProcessingController;
 const ToolPkgMessageProcessingCancellationRegistry = Java.com.ai.assistance.operit.plugins.toolpkg.ToolPkgMessageProcessingCancellationRegistry;
 const FEATURE_KEY = "ai_planning";
+const PROBE_LOG_TAG = "[deepsearching_probe]";
+function logProbe(message) {
+    console.log(`${PROBE_LOG_TAG} ${message}`);
+}
 function getAppContext() {
     if (typeof Java.getApplicationContext !== "function") {
         return null;
@@ -69,11 +73,14 @@ function onApplicationCreate(input) {
 }
 async function onMessageProcessing(input) {
     var _a, _b, _c, _d, _f, _g;
+    const totalStartTime = Date.now();
     const payload = normalizePayload(input);
     const probeOnly = Boolean((_a = payload.probeOnly) !== null && _a !== void 0 ? _a : false);
     const executionId = String((_b = payload.executionId) !== null && _b !== void 0 ? _b : "").trim();
     const message = String((_c = payload.messageContent) !== null && _c !== void 0 ? _c : "").trim();
+    logProbe(`onMessageProcessing start probeOnly=${probeOnly} executionId=${executionId || "none"} messageLength=${message.length}`);
     if (!message) {
+        logProbe(`onMessageProcessing return matched=false reason=empty_message elapsedMs=${Date.now() - totalStartTime}`);
         return { matched: false };
     }
     let context = null;
@@ -81,20 +88,35 @@ async function onMessageProcessing(input) {
     let manager = null;
     let cancellationHandle = null;
     try {
+        const getContextStartTime = Date.now();
         context = getAppContext();
-        if (!context)
-            return { matched: false };
-        const enabled = isDeepSearchEnabled(context);
-        if (!enabled) {
+        logProbe(`getAppContext elapsedMs=${Date.now() - getContextStartTime} hasContext=${Boolean(context)}`);
+        if (!context) {
+            logProbe(`onMessageProcessing return matched=false reason=no_context elapsedMs=${Date.now() - totalStartTime}`);
             return { matched: false };
         }
+        const featureToggleStartTime = Date.now();
+        const enabled = isDeepSearchEnabled(context);
+        logProbe(`isDeepSearchEnabled elapsedMs=${Date.now() - featureToggleStartTime} enabled=${enabled}`);
+        if (!enabled) {
+            logProbe(`onMessageProcessing return matched=false reason=feature_disabled elapsedMs=${Date.now() - totalStartTime}`);
+            return { matched: false };
+        }
+        const getServiceStartTime = Date.now();
         enhancedAIService = EnhancedAIService.getInstance(context);
+        logProbe(`EnhancedAIService.getInstance elapsedMs=${Date.now() - getServiceStartTime}`);
+        const createManagerStartTime = Date.now();
         manager = new plan_mode_manager_1.PlanModeManager(context, enhancedAIService);
+        logProbe(`PlanModeManager ctor elapsedMs=${Date.now() - createManagerStartTime}`);
+        const shouldUseStartTime = Date.now();
         const shouldUse = manager.shouldUseDeepSearchMode(message);
+        logProbe(`shouldUseDeepSearchMode elapsedMs=${Date.now() - shouldUseStartTime} shouldUse=${shouldUse}`);
         if (probeOnly) {
+            logProbe(`onMessageProcessing return probe matched=${shouldUse} elapsedMs=${Date.now() - totalStartTime}`);
             return { matched: shouldUse };
         }
         if (!shouldUse) {
+            logProbe(`onMessageProcessing return matched=false reason=should_use_false elapsedMs=${Date.now() - totalStartTime}`);
             return { matched: false };
         }
         if (!executionId) {
@@ -112,6 +134,7 @@ async function onMessageProcessing(input) {
         const tokenUsageThreshold = Number((_g = payload.tokenUsageThreshold) !== null && _g !== void 0 ? _g : 0);
         if (!maxTokens || !tokenUsageThreshold) {
             console.log("deepsearching missing maxTokens/tokenUsageThreshold");
+            logProbe(`onMessageProcessing return matched=false reason=missing_limits elapsedMs=${Date.now() - totalStartTime}`);
             return { matched: false };
         }
         const emitIntermediateChunk = (chunk) => {
@@ -121,14 +144,19 @@ async function onMessageProcessing(input) {
                 sendIntermediateResult({ chunk });
             }
         };
+        const executeDeepSearchModeStartTime = Date.now();
         const text = await manager.executeDeepSearchMode(message, history, workspacePath, maxTokens, tokenUsageThreshold, emitIntermediateChunk);
+        logProbe(`executeDeepSearchMode elapsedMs=${Date.now() - executeDeepSearchModeStartTime} hasText=${Boolean(text)}`);
         if (!text) {
+            logProbe(`onMessageProcessing return matched=false reason=empty_result elapsedMs=${Date.now() - totalStartTime}`);
             return { matched: false };
         }
+        logProbe(`onMessageProcessing return matched=true elapsedMs=${Date.now() - totalStartTime} textLength=${text.length}`);
         return { matched: true, text };
     }
     catch (error) {
         console.log("deepsearching onMessageProcessing error", String(error));
+        logProbe(`onMessageProcessing error elapsedMs=${Date.now() - totalStartTime} error=${String(error)}`);
         return { matched: false };
     }
     finally {
@@ -138,21 +166,7 @@ async function onMessageProcessing(input) {
             }
         }
         catch (_e) { }
-        try {
-            if (cancellationHandle)
-                Java.releaseJs(cancellationHandle);
-        }
-        catch (_e) { }
-        try {
-            if (context)
-                Java.release(context);
-        }
-        catch (_e) { }
-        try {
-            if (enhancedAIService)
-                Java.release(enhancedAIService);
-        }
-        catch (_e) { }
+        logProbe(`onMessageProcessing finally elapsedMs=${Date.now() - totalStartTime}`);
     }
 }
 function onXmlRender(event) {
@@ -209,12 +223,5 @@ function onInputMenuToggle(input) {
     catch (error) {
         console.log("deepsearching onInputMenuToggle error", String(error));
         return [];
-    }
-    finally {
-        try {
-            if (context)
-                Java.release(context);
-        }
-        catch (_e) { }
     }
 }

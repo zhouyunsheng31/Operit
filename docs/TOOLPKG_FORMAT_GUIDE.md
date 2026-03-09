@@ -326,7 +326,7 @@ exports.onInputMenuToggle = onInputMenuToggle;
 
 **访问资源**：
 - 在子包脚本中：通过 PackageManager API 访问
-- 在 UI 模块中：通过 `ctx.readResource(key)` 访问
+- 在 UI 模块中：通过 `ToolPkg.readResource(key)` 访问
 
 ## 4. 创建 ToolPkg
 
@@ -610,7 +610,7 @@ await ctx.setEnvs({ API_KEY: 'value1', TOKEN: 'value2' });
 
 #### 资源访问
 ```javascript
-const filePath = await ctx.readResource('resource_key');
+const filePath = await ToolPkg.readResource('resource_key');
 ```
 
 #### 包管理
@@ -674,7 +674,7 @@ const spec = ctx.getModuleSpec();
 
 **在 UI 模块中**：
 ```javascript
-const iconPath = await ctx.readResource('icon');
+const iconPath = await ToolPkg.readResource('icon');
 // iconPath 是资源文件在设备上的临时路径
 ```
 

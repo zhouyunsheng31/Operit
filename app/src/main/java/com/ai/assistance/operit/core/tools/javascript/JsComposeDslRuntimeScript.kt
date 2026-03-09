@@ -63,11 +63,18 @@ internal fun buildComposeDslRuntimeWrappedScript(script: String): String {
                 if (typeof OperitComposeDslRuntime === 'undefined') {
                     throw new Error('OperitComposeDslRuntime bridge is not initialized');
                 }
+                var __root = typeof globalThis !== 'undefined'
+                    ? globalThis
+                    : (typeof window !== 'undefined' ? window : this);
+                var __activeCallRuntime =
+                    typeof __root.__operit_call_runtime_ref === 'object' && __root.__operit_call_runtime_ref
+                        ? __root.__operit_call_runtime_ref
+                        : null;
                 var __options = __runtimeOptions && typeof __runtimeOptions === 'object'
                     ? Object.assign({}, __runtimeOptions)
                     : {};
-                if (typeof __operit_call_runtime_ref === 'object' && __operit_call_runtime_ref) {
-                    __options.__operit_call_runtime = __operit_call_runtime_ref;
+                if (__activeCallRuntime) {
+                    __options.__operit_call_runtime = __activeCallRuntime;
                 }
                 var __bundle = OperitComposeDslRuntime.createContext(__options);
                 var __entry = __operitResolveComposeEntry();
@@ -76,24 +83,32 @@ internal fun buildComposeDslRuntimeWrappedScript(script: String): String {
                         'compose_dsl entry function not found, expected default export or Screen function'
                     );
                 }
-                if (typeof window !== 'undefined') {
-                    window.__operit_compose_bundle = __bundle;
-                    window.__operit_compose_entry = __entry;
+                if (__activeCallRuntime && typeof __bundle.setCallRuntime === 'function') {
+                    __bundle.setCallRuntime(__activeCallRuntime);
                 }
+                __root.__operit_compose_bundle = __bundle;
+                __root.__operit_compose_entry = __entry;
                 return __operit_build_compose_response(__bundle, __entry);
             }
 
             function __operit_dispatch_compose_dsl_action(__actionRequest) {
-                if (typeof window === 'undefined') {
-                    throw new Error('compose action dispatch requires window runtime');
-                }
-                var __bundle = window.__operit_compose_bundle;
-                var __entry = window.__operit_compose_entry;
+                var __root = typeof globalThis !== 'undefined'
+                    ? globalThis
+                    : (typeof window !== 'undefined' ? window : this);
+                var __bundle = __root.__operit_compose_bundle;
+                var __entry = __root.__operit_compose_entry;
                 if (!__bundle || typeof __entry !== 'function') {
                     throw new Error('compose_dsl runtime is not initialized, render first');
                 }
                 if (typeof __bundle.invokeAction !== 'function') {
                     throw new Error('compose_dsl runtime action bridge is not available');
+                }
+                var __activeCallRuntime =
+                    typeof __root.__operit_call_runtime_ref === 'object' && __root.__operit_call_runtime_ref
+                        ? __root.__operit_call_runtime_ref
+                        : null;
+                if (__activeCallRuntime && typeof __bundle.setCallRuntime === 'function') {
+                    __bundle.setCallRuntime(__activeCallRuntime);
                 }
 
                 var __request =
@@ -248,11 +263,12 @@ internal fun buildComposeDslRuntimeWrappedScript(script: String): String {
                 module.exports.__operit_dispatch_compose_dsl_action =
                     __operit_dispatch_compose_dsl_action;
             }
-            if (typeof window !== 'undefined') {
-                window.__operit_render_compose_dsl = __operit_render_compose_dsl;
-                window.__operit_dispatch_compose_dsl_action =
-                    __operit_dispatch_compose_dsl_action;
-            }
+            var __root = typeof globalThis !== 'undefined'
+                ? globalThis
+                : (typeof window !== 'undefined' ? window : this);
+            __root.__operit_render_compose_dsl = __operit_render_compose_dsl;
+            __root.__operit_dispatch_compose_dsl_action =
+                __operit_dispatch_compose_dsl_action;
         })();
     """.trimIndent()
 }

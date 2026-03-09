@@ -17,129 +17,75 @@ data class ToolPkgMainRegistrationCapture(
     val promptFinalizeHooks: List<String>
 )
 
-private data class MutableToolPkgMainRegistrationCapture(
-    val toolboxUiModules: MutableList<String> = mutableListOf(),
-    val appLifecycleHooks: MutableList<String> = mutableListOf(),
-    val messageProcessingPlugins: MutableList<String> = mutableListOf(),
-    val xmlRenderPlugins: MutableList<String> = mutableListOf(),
-    val inputMenuTogglePlugins: MutableList<String> = mutableListOf(),
-    val toolLifecycleHooks: MutableList<String> = mutableListOf(),
-    val promptInputHooks: MutableList<String> = mutableListOf(),
-    val promptHistoryHooks: MutableList<String> = mutableListOf(),
-    val systemPromptComposeHooks: MutableList<String> = mutableListOf(),
-    val toolPromptComposeHooks: MutableList<String> = mutableListOf(),
-    val promptFinalizeHooks: MutableList<String> = mutableListOf()
-)
+private enum class RegistrationBucket {
+    TOOLBOX_UI,
+    APP_LIFECYCLE,
+    MESSAGE_PROCESSING,
+    XML_RENDER,
+    INPUT_MENU_TOGGLE,
+    TOOL_LIFECYCLE,
+    PROMPT_INPUT,
+    PROMPT_HISTORY,
+    SYSTEM_PROMPT_COMPOSE,
+    TOOL_PROMPT_COMPOSE,
+    PROMPT_FINALIZE
+}
 
 internal class JsToolPkgRegistrationSession {
     private val lock = Any()
-    private var capture: MutableToolPkgMainRegistrationCapture? = null
+    private var capture: MutableMap<RegistrationBucket, MutableList<String>>? = null
 
     fun begin() {
         synchronized(lock) {
-            capture = MutableToolPkgMainRegistrationCapture()
+            capture = mutableMapOf()
         }
     }
 
-    fun appendToolboxUiModule(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.toolboxUiModules.add(normalized)
-        }
-    }
+    fun appendToolboxUiModule(specJson: String) = append(RegistrationBucket.TOOLBOX_UI, specJson)
+    fun appendAppLifecycleHook(specJson: String) = append(RegistrationBucket.APP_LIFECYCLE, specJson)
+    fun appendMessageProcessingPlugin(specJson: String) =
+        append(RegistrationBucket.MESSAGE_PROCESSING, specJson)
 
-    fun appendAppLifecycleHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.appLifecycleHooks.add(normalized)
-        }
-    }
+    fun appendXmlRenderPlugin(specJson: String) = append(RegistrationBucket.XML_RENDER, specJson)
+    fun appendInputMenuTogglePlugin(specJson: String) =
+        append(RegistrationBucket.INPUT_MENU_TOGGLE, specJson)
 
-    fun appendMessageProcessingPlugin(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.messageProcessingPlugins.add(normalized)
-        }
-    }
+    fun appendToolLifecycleHook(specJson: String) =
+        append(RegistrationBucket.TOOL_LIFECYCLE, specJson)
 
-    fun appendXmlRenderPlugin(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.xmlRenderPlugins.add(normalized)
-        }
-    }
+    fun appendPromptInputHook(specJson: String) = append(RegistrationBucket.PROMPT_INPUT, specJson)
+    fun appendPromptHistoryHook(specJson: String) =
+        append(RegistrationBucket.PROMPT_HISTORY, specJson)
 
-    fun appendInputMenuTogglePlugin(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.inputMenuTogglePlugins.add(normalized)
-        }
-    }
+    fun appendSystemPromptComposeHook(specJson: String) =
+        append(RegistrationBucket.SYSTEM_PROMPT_COMPOSE, specJson)
 
-    fun appendToolLifecycleHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.toolLifecycleHooks.add(normalized)
-        }
-    }
+    fun appendToolPromptComposeHook(specJson: String) =
+        append(RegistrationBucket.TOOL_PROMPT_COMPOSE, specJson)
 
-    fun appendPromptInputHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.promptInputHooks.add(normalized)
-        }
-    }
-
-    fun appendPromptHistoryHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.promptHistoryHooks.add(normalized)
-        }
-    }
-
-    fun appendSystemPromptComposeHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.systemPromptComposeHooks.add(normalized)
-        }
-    }
-
-    fun appendToolPromptComposeHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.toolPromptComposeHooks.add(normalized)
-        }
-    }
-
-    fun appendPromptFinalizeHook(specJson: String) {
-        val normalized = normalizeRegistrationSpec(specJson)
-        withActiveCapture { current ->
-            current.promptFinalizeHooks.add(normalized)
-        }
-    }
+    fun appendPromptFinalizeHook(specJson: String) =
+        append(RegistrationBucket.PROMPT_FINALIZE, specJson)
 
     fun finish(executionResult: Any?): ToolPkgMainRegistrationCapture {
-        if (executionResult is String) {
-            val normalized = executionResult.trim()
-            if (normalized.startsWith("Error:", ignoreCase = true)) {
-                val message = normalized.substringAfter(":", normalized).trim()
-                throw IllegalStateException(message.ifBlank { "toolpkg main registration failed" })
-            }
+        if (executionResult is String && executionResult.trim().startsWith("Error:", ignoreCase = true)) {
+            val message = executionResult.substringAfter(':', executionResult).trim()
+            throw IllegalStateException(message.ifBlank { "toolpkg main registration failed" })
         }
         synchronized(lock) {
-            val current = capture ?: MutableToolPkgMainRegistrationCapture()
+            val current = capture.orEmpty()
+            fun read(bucket: RegistrationBucket): List<String> = current[bucket]?.toList().orEmpty()
             return ToolPkgMainRegistrationCapture(
-                toolboxUiModules = current.toolboxUiModules.toList(),
-                appLifecycleHooks = current.appLifecycleHooks.toList(),
-                messageProcessingPlugins = current.messageProcessingPlugins.toList(),
-                xmlRenderPlugins = current.xmlRenderPlugins.toList(),
-                inputMenuTogglePlugins = current.inputMenuTogglePlugins.toList(),
-                toolLifecycleHooks = current.toolLifecycleHooks.toList(),
-                promptInputHooks = current.promptInputHooks.toList(),
-                promptHistoryHooks = current.promptHistoryHooks.toList(),
-                systemPromptComposeHooks = current.systemPromptComposeHooks.toList(),
-                toolPromptComposeHooks = current.toolPromptComposeHooks.toList(),
-                promptFinalizeHooks = current.promptFinalizeHooks.toList()
+                toolboxUiModules = read(RegistrationBucket.TOOLBOX_UI),
+                appLifecycleHooks = read(RegistrationBucket.APP_LIFECYCLE),
+                messageProcessingPlugins = read(RegistrationBucket.MESSAGE_PROCESSING),
+                xmlRenderPlugins = read(RegistrationBucket.XML_RENDER),
+                inputMenuTogglePlugins = read(RegistrationBucket.INPUT_MENU_TOGGLE),
+                toolLifecycleHooks = read(RegistrationBucket.TOOL_LIFECYCLE),
+                promptInputHooks = read(RegistrationBucket.PROMPT_INPUT),
+                promptHistoryHooks = read(RegistrationBucket.PROMPT_HISTORY),
+                systemPromptComposeHooks = read(RegistrationBucket.SYSTEM_PROMPT_COMPOSE),
+                toolPromptComposeHooks = read(RegistrationBucket.TOOL_PROMPT_COMPOSE),
+                promptFinalizeHooks = read(RegistrationBucket.PROMPT_FINALIZE)
             )
         }
     }
@@ -150,342 +96,221 @@ internal class JsToolPkgRegistrationSession {
         }
     }
 
-    private fun withActiveCapture(action: (MutableToolPkgMainRegistrationCapture) -> Unit) {
+    private fun append(bucket: RegistrationBucket, specJson: String) {
+        val normalized = normalizeRegistrationSpec(specJson)
         synchronized(lock) {
-            val current =
-                capture ?: throw IllegalStateException("toolpkg registration session is not active")
-            action(current)
+            val target = capture ?: error("toolpkg registration session is not active")
+            target.getOrPut(bucket) { mutableListOf() }.add(normalized)
         }
     }
 
     private fun normalizeRegistrationSpec(specJson: String): String {
         val trimmed = specJson.trim()
-        if (trimmed.isEmpty()) {
-            throw IllegalArgumentException("toolpkg registration payload is empty")
-        }
+        require(trimmed.isNotEmpty()) { "toolpkg registration payload is empty" }
         val parsed = JSONTokener(trimmed).nextValue()
-        if (parsed !is JSONObject) {
-            throw IllegalArgumentException("toolpkg registration payload must be a JSON object")
-        }
+        require(parsed is JSONObject) { "toolpkg registration payload must be a JSON object" }
         return parsed.toString()
     }
 }
 
 internal fun buildToolPkgRegistrationBridgeScript(): String {
     return """
-        var __operitToolPkgHookCounter = 0;
+        (function() {
+            var root = typeof globalThis !== 'undefined'
+                ? globalThis
+                : (typeof window !== 'undefined' ? window : this);
+            var inlineHookCounter = 0;
 
-        function registerToolPkgToolboxUiModule(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgToolboxUiModule expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgToolboxUiModule !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgToolboxUiModule is unavailable");
-            }
-            var normalized = {};
-            var keys = Object.keys(definition);
-            for (var i = 0; i < keys.length; i += 1) {
-                var key = keys[i];
-                if (key === 'screen') {
-                    continue;
+            function installGlobal(name, value) {
+                var key = String(name || '').trim();
+                if (!key || value === undefined) {
+                    return;
                 }
-                normalized[key] = definition[key];
+                try { globalThis[key] = value; } catch (_e) {}
+                try { window[key] = value; } catch (_e2) {}
             }
 
-            var rawScreen = definition.screen;
-            var resolvedScreen = '';
-            if (typeof rawScreen === 'string') {
-                resolvedScreen = rawScreen.trim().replace(/\\/g, '/');
-            } else if (typeof rawScreen === 'function') {
-                var marker = rawScreen.__operit_toolpkg_module_path;
-                if (typeof marker === 'string') {
-                    resolvedScreen = marker.trim().replace(/\\/g, '/');
+            function requireNative(name) {
+                if (
+                    typeof NativeInterface === 'undefined' ||
+                    !NativeInterface ||
+                    typeof NativeInterface[name] !== 'function'
+                ) {
+                    throw new Error('NativeInterface.' + name + ' is unavailable');
                 }
-            } else if (rawScreen && typeof rawScreen === 'object' && typeof rawScreen.default === 'function') {
-                var defaultMarker = rawScreen.default.__operit_toolpkg_module_path;
-                if (typeof defaultMarker === 'string') {
-                    resolvedScreen = defaultMarker.trim().replace(/\\/g, '/');
+                return NativeInterface[name].bind(NativeInterface);
+            }
+
+            function copyObject(source, excludedKey) {
+                var output = {};
+                var keys = Object.keys(source || {});
+                for (var i = 0; i < keys.length; i += 1) {
+                    var key = keys[i];
+                    if (key !== excludedKey) {
+                        output[key] = source[key];
+                    }
                 }
+                return output;
             }
 
-            if (!resolvedScreen) {
-                throw new Error("registerToolPkgToolboxUiModule requires a serializable screen reference");
+            function getActiveExports() {
+                return typeof root.__operitGetActiveModuleExports === 'function'
+                    ? root.__operitGetActiveModuleExports()
+                    : null;
             }
-            normalized.screen = resolvedScreen;
-            NativeInterface.registerToolPkgToolboxUiModule(JSON.stringify(normalized));
-        }
 
-        function registerToolPkgAppLifecycleHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgAppLifecycleHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgAppLifecycleHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgAppLifecycleHook is unavailable");
-            }
-            var normalized = {};
-            var keys = Object.keys(definition);
-            for (var i = 0; i < keys.length; i += 1) {
-                var key = keys[i];
-                if (key === 'function') {
-                    continue;
+            function resolveExportedFunctionName(fn) {
+                var exportsRef = getActiveExports();
+                if (!exportsRef || typeof exportsRef !== 'object') {
+                    return '';
                 }
-                normalized[key] = definition[key];
+                var keys = Object.keys(exportsRef);
+                for (var i = 0; i < keys.length; i += 1) {
+                    if (exportsRef[keys[i]] === fn) {
+                        return keys[i];
+                    }
+                }
+                return '';
             }
 
-            var rawFunction = definition.function;
-            var resolvedFunction = '';
-            var functionSource = '';
-            if (typeof rawFunction === 'function') {
-                var exportsRef =
-                    (typeof window.__operitGetActiveModuleExports === 'function')
-                        ? window.__operitGetActiveModuleExports()
+            function buildInlineFunctionName(definition) {
+                inlineHookCounter += 1;
+                var rawId = String((definition && definition.id) || 'hook');
+                var safeId = rawId.replace(/[^a-zA-Z0-9_$]/g, '_') || 'hook';
+                return '__operit_inline_hook_' + safeId + '_' + inlineHookCounter;
+            }
+
+            function normalizeFunctionField(definition, fieldName, label) {
+                if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
+                    throw new Error(label + ' expects an object');
+                }
+                var normalized = copyObject(definition, fieldName);
+                var fn = definition[fieldName];
+                if (typeof fn !== 'function') {
+                    throw new Error(label + ' requires a function reference');
+                }
+                var exportedName = resolveExportedFunctionName(fn);
+                normalized[fieldName] = exportedName || buildInlineFunctionName(definition);
+                if (!exportedName) {
+                    normalized.function_source = String(fn);
+                }
+                return normalized;
+            }
+
+            function normalizeScreenField(definition, label) {
+                if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
+                    throw new Error(label + ' expects an object');
+                }
+                var normalized = copyObject(definition, 'screen');
+                var screen = definition.screen;
+                var path = '';
+                if (typeof screen === 'string') {
+                    path = screen.trim().replace(/\\/g, '/');
+                } else if (typeof screen === 'function' && typeof screen.__operit_toolpkg_module_path === 'string') {
+                    path = screen.__operit_toolpkg_module_path.trim().replace(/\\/g, '/');
+                } else if (
+                    screen &&
+                    typeof screen === 'object' &&
+                    typeof screen.default === 'function' &&
+                    typeof screen.default.__operit_toolpkg_module_path === 'string'
+                ) {
+                    path = screen.default.__operit_toolpkg_module_path.trim().replace(/\\/g, '/');
+                }
+                if (!path) {
+                    throw new Error(label + ' requires a serializable screen reference');
+                }
+                normalized.screen = path;
+                return normalized;
+            }
+
+            function registerWithNative(definition, label, nativeMethod, fieldName) {
+                var normalized = fieldName
+                    ? normalizeFunctionField(definition, fieldName, label)
+                    : normalizeScreenField(definition, label);
+                requireNative(nativeMethod)(JSON.stringify(normalized));
+            }
+
+            function resolveCurrentToolPkgTarget() {
+                var callId = String(root.__operitCurrentCallId || '').trim();
+                var callState =
+                    callId && typeof root.__operitGetCallState === 'function'
+                        ? root.__operitGetCallState(callId)
                         : null;
-                if (exportsRef && typeof exportsRef === 'object') {
-                    var exportKeys = Object.keys(exportsRef);
-                    for (var i = 0; i < exportKeys.length; i += 1) {
-                        var exportKey = exportKeys[i];
-                        if (exportsRef[exportKey] === rawFunction) {
-                            resolvedFunction = exportKey;
-                            break;
-                        }
-                    }
-                }
-
-                if (!resolvedFunction) {
-                    __operitToolPkgHookCounter += 1;
-                    var hookIdPart = String(definition.id || 'hook').replace(/[^a-zA-Z0-9_$]/g, '_');
-                    if (!hookIdPart) {
-                        hookIdPart = 'hook';
-                    }
-                    resolvedFunction = "__operit_inline_hook_" + hookIdPart + "_" + __operitToolPkgHookCounter;
-                    functionSource = String(rawFunction);
-                }
-            }
-
-            if (!resolvedFunction) {
-                throw new Error("registerToolPkgAppLifecycleHook requires a function reference");
-            }
-            normalized.function = resolvedFunction;
-            if (functionSource) {
-                normalized.function_source = functionSource;
-            }
-            NativeInterface.registerToolPkgAppLifecycleHook(JSON.stringify(normalized));
-        }
-
-        function __operitResolveFunctionField(definition, fieldName, errorMessagePrefix) {
-            var normalized = {};
-            var keys = Object.keys(definition);
-            for (var i = 0; i < keys.length; i += 1) {
-                var key = keys[i];
-                if (key === fieldName) {
-                    continue;
-                }
-                normalized[key] = definition[key];
-            }
-
-            var rawFunction = definition[fieldName];
-            var resolvedFunction = '';
-            var functionSource = '';
-            if (typeof rawFunction === 'function') {
-                var exportsRef =
-                    (typeof window.__operitGetActiveModuleExports === 'function')
-                        ? window.__operitGetActiveModuleExports()
+                var params =
+                    callState && callState.params && typeof callState.params === 'object'
+                        ? callState.params
                         : null;
-                if (exportsRef && typeof exportsRef === 'object') {
-                    var exportKeys = Object.keys(exportsRef);
-                    for (var i = 0; i < exportKeys.length; i += 1) {
-                        var exportKey = exportKeys[i];
-                        if (exportsRef[exportKey] === rawFunction) {
-                            resolvedFunction = exportKey;
-                            break;
-                        }
+                if (!params) {
+                    return '';
+                }
+                var candidates = [
+                    params.__operit_ui_package_name,
+                    params.toolPkgId,
+                    params.containerPackageName,
+                    params.__operit_toolpkg_subpackage_id,
+                    params.__operit_package_name
+                ];
+                for (var i = 0; i < candidates.length; i += 1) {
+                    var value = String(candidates[i] || '').trim();
+                    if (value) {
+                        return value;
                     }
                 }
+                return '';
+            }
 
-                if (!resolvedFunction) {
-                    __operitToolPkgHookCounter += 1;
-                    var hookIdPart = String(definition.id || 'hook').replace(/[^a-zA-Z0-9_$]/g, '_');
-                    if (!hookIdPart) {
-                        hookIdPart = 'hook';
-                    }
-                    resolvedFunction = "__operit_inline_hook_" + hookIdPart + "_" + __operitToolPkgHookCounter;
-                    functionSource = String(rawFunction);
+            function readToolPkgResource(key, outputFileName) {
+                var resourceKey = String(key || '').trim();
+                if (!resourceKey) {
+                    return Promise.reject(new Error('resource key is required'));
                 }
+                var target = resolveCurrentToolPkgTarget();
+                if (!target) {
+                    return Promise.reject(new Error('package/toolpkg runtime target is empty'));
+                }
+                var path = requireNative('readToolPkgResource')(
+                    target,
+                    resourceKey,
+                    outputFileName == null ? '' : String(outputFileName).trim()
+                );
+                if (typeof path === 'string' && path.trim()) {
+                    return Promise.resolve(path);
+                }
+                return Promise.reject(new Error('resource not found: ' + resourceKey));
             }
 
-            if (!resolvedFunction) {
-                throw new Error(errorMessagePrefix + " requires a function reference");
-            }
-            normalized[fieldName] = resolvedFunction;
-            if (functionSource) {
-                normalized.function_source = functionSource;
-            }
-            return normalized;
-        }
+            var api = {
+                registerToolboxUiModule: function(definition) {
+                    registerWithNative(
+                        definition,
+                        'registerToolPkgToolboxUiModule',
+                        'registerToolPkgToolboxUiModule',
+                        ''
+                    );
+                },
+                readResource: readToolPkgResource
+            };
 
-        function registerToolPkgMessageProcessingPlugin(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgMessageProcessingPlugin expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgMessageProcessingPlugin !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgMessageProcessingPlugin is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgMessageProcessingPlugin"
-            );
-            NativeInterface.registerToolPkgMessageProcessingPlugin(JSON.stringify(normalized));
-        }
+            [
+                ['registerAppLifecycleHook', 'registerToolPkgAppLifecycleHook'],
+                ['registerMessageProcessingPlugin', 'registerToolPkgMessageProcessingPlugin'],
+                ['registerXmlRenderPlugin', 'registerToolPkgXmlRenderPlugin'],
+                ['registerInputMenuTogglePlugin', 'registerToolPkgInputMenuTogglePlugin'],
+                ['registerToolLifecycleHook', 'registerToolPkgToolLifecycleHook'],
+                ['registerPromptInputHook', 'registerToolPkgPromptInputHook'],
+                ['registerPromptHistoryHook', 'registerToolPkgPromptHistoryHook'],
+                ['registerSystemPromptComposeHook', 'registerToolPkgSystemPromptComposeHook'],
+                ['registerToolPromptComposeHook', 'registerToolPkgToolPromptComposeHook'],
+                ['registerPromptFinalizeHook', 'registerToolPkgPromptFinalizeHook']
+            ].forEach(function(entry) {
+                var apiName = entry[0];
+                var nativeMethod = entry[1];
+                api[apiName] = function(definition) {
+                    registerWithNative(definition, apiName, nativeMethod, 'function');
+                };
+            });
 
-        function registerToolPkgXmlRenderPlugin(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgXmlRenderPlugin expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgXmlRenderPlugin !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgXmlRenderPlugin is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgXmlRenderPlugin"
-            );
-            NativeInterface.registerToolPkgXmlRenderPlugin(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgInputMenuTogglePlugin(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgInputMenuTogglePlugin expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgInputMenuTogglePlugin !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgInputMenuTogglePlugin is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgInputMenuTogglePlugin"
-            );
-            NativeInterface.registerToolPkgInputMenuTogglePlugin(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgToolLifecycleHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgToolLifecycleHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgToolLifecycleHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgToolLifecycleHook is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgToolLifecycleHook"
-            );
-            NativeInterface.registerToolPkgToolLifecycleHook(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgPromptInputHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgPromptInputHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgPromptInputHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgPromptInputHook is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgPromptInputHook"
-            );
-            NativeInterface.registerToolPkgPromptInputHook(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgPromptHistoryHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgPromptHistoryHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgPromptHistoryHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgPromptHistoryHook is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgPromptHistoryHook"
-            );
-            NativeInterface.registerToolPkgPromptHistoryHook(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgSystemPromptComposeHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgSystemPromptComposeHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgSystemPromptComposeHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgSystemPromptComposeHook is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgSystemPromptComposeHook"
-            );
-            NativeInterface.registerToolPkgSystemPromptComposeHook(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgToolPromptComposeHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgToolPromptComposeHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgToolPromptComposeHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgToolPromptComposeHook is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgToolPromptComposeHook"
-            );
-            NativeInterface.registerToolPkgToolPromptComposeHook(JSON.stringify(normalized));
-        }
-
-        function registerToolPkgPromptFinalizeHook(definition) {
-            if (!definition || typeof definition !== 'object' || Array.isArray(definition)) {
-                throw new Error("registerToolPkgPromptFinalizeHook expects an object");
-            }
-            if (typeof NativeInterface === 'undefined' || typeof NativeInterface.registerToolPkgPromptFinalizeHook !== 'function') {
-                throw new Error("NativeInterface.registerToolPkgPromptFinalizeHook is unavailable");
-            }
-            var normalized = __operitResolveFunctionField(
-                definition,
-                "function",
-                "registerToolPkgPromptFinalizeHook"
-            );
-            NativeInterface.registerToolPkgPromptFinalizeHook(JSON.stringify(normalized));
-        }
-
-        function __operitInstallGlobal(name, value) {
-            var key = String(name || '').trim();
-            if (!key || value === undefined) {
-                return;
-            }
-            try {
-                globalThis[key] = value;
-            } catch (_globalError) {
-            }
-            try {
-                window[key] = value;
-            } catch (_windowError) {
-            }
-        }
-
-        var __operitToolPkgApi = {
-            registerToolboxUiModule: registerToolPkgToolboxUiModule,
-            registerAppLifecycleHook: registerToolPkgAppLifecycleHook,
-            registerMessageProcessingPlugin: registerToolPkgMessageProcessingPlugin,
-            registerXmlRenderPlugin: registerToolPkgXmlRenderPlugin,
-            registerInputMenuTogglePlugin: registerToolPkgInputMenuTogglePlugin,
-            registerToolLifecycleHook: registerToolPkgToolLifecycleHook,
-            registerPromptInputHook: registerToolPkgPromptInputHook,
-            registerPromptHistoryHook: registerToolPkgPromptHistoryHook,
-            registerSystemPromptComposeHook: registerToolPkgSystemPromptComposeHook,
-            registerToolPromptComposeHook: registerToolPkgToolPromptComposeHook,
-            registerPromptFinalizeHook: registerToolPkgPromptFinalizeHook
-        };
-        __operitInstallGlobal("ToolPkg", __operitToolPkgApi);
+            installGlobal('ToolPkg', api);
+        })();
     """.trimIndent()
 }

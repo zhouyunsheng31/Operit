@@ -307,7 +307,7 @@ function Screen(ctx) {
         step1MessageState.set("");
         setErrorMessage("");
         try {
-            const resource = await ctx.readResource(PC_AGENT_RESOURCE_KEY);
+            const resource = await ToolPkg.readResource(PC_AGENT_RESOURCE_KEY);
             const path = typeof resource === "string" ? resource.trim() : "";
             if (!path) {
                 throw new Error(TEXT.step1MissingResource);

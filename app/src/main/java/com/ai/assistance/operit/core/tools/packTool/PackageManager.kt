@@ -2,6 +2,8 @@ package com.ai.assistance.operit.core.tools.packTool
 
 import android.content.Context
 import android.os.Looper
+import com.ai.assistance.operit.core.chat.logMessageTiming
+import com.ai.assistance.operit.core.chat.messageTimingNow
 import com.ai.assistance.operit.util.AppLogger
 import com.ai.assistance.operit.core.tools.AIToolHandler
 import com.ai.assistance.operit.core.tools.StringResultData
@@ -477,6 +479,7 @@ private constructor(private val context: Context, private val aiToolHandler: AIT
     }
 
     private fun getToolPkgMainScript(containerPackageName: String): String? {
+        val totalStartTime = messageTimingNow()
         ensureInitialized()
         val normalizedContainerPackageName = normalizePackageName(containerPackageName)
         val runtime = toolPkgContainers[normalizedContainerPackageName] ?: return null
@@ -489,8 +492,20 @@ private constructor(private val context: Context, private val aiToolHandler: AIT
         }
 
         return try {
+            val readBytesStartTime = messageTimingNow()
             val bytes = readToolPkgResourceBytes(runtime, runtime.mainEntry) ?: return null
-            bytes.toString(StandardCharsets.UTF_8)
+            logMessageTiming(
+                stage = "toolpkg.getMainScript.readBytes",
+                startTimeMs = readBytesStartTime,
+                details = "container=${runtime.packageName}, sourceType=${runtime.sourceType}, entry=${runtime.mainEntry}, bytes=${bytes.size}"
+            )
+            val script = bytes.toString(StandardCharsets.UTF_8)
+            logMessageTiming(
+                stage = "toolpkg.getMainScript.total",
+                startTimeMs = totalStartTime,
+                details = "container=${runtime.packageName}, entry=${runtime.mainEntry}, scriptLength=${script.length}"
+            )
+            script
         } catch (e: Exception) {
             AppLogger.e(
                 TAG,

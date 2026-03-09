@@ -1,6 +1,8 @@
 package com.ai.assistance.operit.core.tools.javascript
 
 import com.ai.assistance.operit.util.AppLogger
+import java.lang.ref.PhantomReference
+import java.lang.ref.ReferenceQueue
 import java.lang.reflect.Array as ReflectArray
 import java.lang.reflect.Constructor
 import java.lang.reflect.Field
@@ -8,6 +10,8 @@ import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
 import java.lang.reflect.Proxy
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -20,6 +24,7 @@ import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 
 internal typealias JsInterfaceCallbackInvoker = (jsObjectId: String, methodName: String, argsJson: String) -> String
+internal typealias JsInterfaceReleaseInvoker = (jsObjectId: String) -> Unit
 
 internal object JsJavaBridgeDelegates {
     private const val TAG = "JsJavaBridge"
@@ -69,9 +74,42 @@ internal object JsJavaBridgeDelegates {
         val error: String?
     )
 
-    fun classExists(className: String): Boolean {
+    private class JsInterfaceProxyReference(
+        referent: Any,
+        val callbackInvoker: JsInterfaceCallbackInvoker,
+        val jsObjectIds: Set<String>
+    ) : PhantomReference<Any>(referent, jsInterfaceProxyReferenceQueue)
+
+    private val jsInterfaceProxyReferenceQueue = ReferenceQueue<Any>()
+    private val jsInterfaceProxyReferences =
+        Collections.newSetFromMap(ConcurrentHashMap<JsInterfaceProxyReference, Boolean>())
+    private val jsInterfaceLifecycleLock = Any()
+    private val jsInterfaceReleaseInvokers =
+        IdentityHashMap<JsInterfaceCallbackInvoker, JsInterfaceReleaseInvoker>()
+    private val jsInterfaceReferenceCounts =
+        IdentityHashMap<JsInterfaceCallbackInvoker, MutableMap<String, Int>>()
+    private val jsInterfaceLifecycleWorkerStarted = AtomicBoolean(false)
+
+    fun registerJsInterfaceReleaseInvoker(
+        callbackInvoker: JsInterfaceCallbackInvoker,
+        releaseInvoker: JsInterfaceReleaseInvoker
+    ) {
+        ensureJsInterfaceLifecycleWorker()
+        synchronized(jsInterfaceLifecycleLock) {
+            jsInterfaceReleaseInvokers[callbackInvoker] = releaseInvoker
+        }
+    }
+
+    fun unregisterJsInterfaceReleaseInvoker(callbackInvoker: JsInterfaceCallbackInvoker) {
+        synchronized(jsInterfaceLifecycleLock) {
+            jsInterfaceReleaseInvokers.remove(callbackInvoker)
+            jsInterfaceReferenceCounts.remove(callbackInvoker)
+        }
+    }
+
+    fun classExists(className: String, bridgeClassLoader: ClassLoader? = null): Boolean {
         return try {
-            loadClass(className)
+            loadClass(className, bridgeClassLoader)
             true
         } catch (_: Exception) {
             false
@@ -86,7 +124,7 @@ internal object JsJavaBridgeDelegates {
         bridgeClassLoader: ClassLoader? = null
     ): String {
         return runBridgeCall(objectRegistry) {
-            val clazz = loadClass(className)
+            val clazz = loadClass(className, bridgeClassLoader)
             val rawArgs = parseArgsJson(argsJson, objectRegistry)
             val constructorMatch =
                 selectConstructor(
@@ -109,7 +147,7 @@ internal object JsJavaBridgeDelegates {
         bridgeClassLoader: ClassLoader? = null
     ): String {
         return runBridgeCall(objectRegistry) {
-            val clazz = loadClass(className)
+            val clazz = loadClass(className, bridgeClassLoader)
             val normalizedMethodName = methodName.trim()
             require(normalizedMethodName.isNotEmpty()) { "method name is required" }
 
@@ -166,7 +204,7 @@ internal object JsJavaBridgeDelegates {
         jsCallbackInvoker: JsInterfaceCallbackInvoker? = null,
         bridgeClassLoader: ClassLoader? = null
     ) {
-        val target = loadClass(className)
+        val target = loadClass(className, bridgeClassLoader)
         callSuspendInternal(
             targetClass = target,
             instance = null,
@@ -206,10 +244,11 @@ internal object JsJavaBridgeDelegates {
     fun getStaticField(
         className: String,
         fieldName: String,
-        objectRegistry: ConcurrentHashMap<String, Any>
+        objectRegistry: ConcurrentHashMap<String, Any>,
+        bridgeClassLoader: ClassLoader? = null
     ): String {
         return runBridgeCall(objectRegistry) {
-            val clazz = loadClass(className)
+            val clazz = loadClass(className, bridgeClassLoader)
             val normalizedFieldName = fieldName.trim()
             require(normalizedFieldName.isNotEmpty()) { "field name is required" }
 
@@ -236,7 +275,7 @@ internal object JsJavaBridgeDelegates {
         bridgeClassLoader: ClassLoader? = null
     ): String {
         return runBridgeCall(objectRegistry) {
-            val clazz = loadClass(className)
+            val clazz = loadClass(className, bridgeClassLoader)
             val normalizedFieldName = fieldName.trim()
             require(normalizedFieldName.isNotEmpty()) { "field name is required" }
 
@@ -359,11 +398,116 @@ internal object JsJavaBridgeDelegates {
         }
     }
 
-    fun releaseAllInstances(objectRegistry: ConcurrentHashMap<String, Any>): String {
-        return runBridgeCall(objectRegistry) {
-            val size = objectRegistry.size
-            objectRegistry.clear()
-            size
+    private fun ensureJsInterfaceLifecycleWorker() {
+        if (!jsInterfaceLifecycleWorkerStarted.compareAndSet(false, true)) {
+            return
+        }
+
+        Thread {
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    val reference = jsInterfaceProxyReferenceQueue.remove() as? JsInterfaceProxyReference ?: continue
+                    jsInterfaceProxyReferences.remove(reference)
+                    releaseCollectedJsInterfaceProxy(reference)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return@Thread
+                } catch (e: Exception) {
+                    AppLogger.e(TAG, "Failed to release collected JS interface proxy: ${e.message}", e)
+                }
+            }
+        }.apply {
+            isDaemon = true
+            name = "OperitJsInterfaceRelease"
+        }.start()
+    }
+
+    private fun trackJsInterfaceProxy(
+        proxy: Any,
+        callbackInvoker: JsInterfaceCallbackInvoker,
+        jsObjectIds: Collection<String>
+    ) {
+        val normalizedIds =
+            jsObjectIds
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .toSet()
+        if (normalizedIds.isEmpty()) {
+            return
+        }
+
+        ensureJsInterfaceLifecycleWorker()
+        synchronized(jsInterfaceLifecycleLock) {
+            if (!jsInterfaceReleaseInvokers.containsKey(callbackInvoker)) {
+                return
+            }
+            val counts = jsInterfaceReferenceCounts.getOrPut(callbackInvoker) { LinkedHashMap() }
+            normalizedIds.forEach { jsObjectId ->
+                counts[jsObjectId] = (counts[jsObjectId] ?: 0) + 1
+            }
+        }
+
+        jsInterfaceProxyReferences.add(
+            JsInterfaceProxyReference(
+                referent = proxy,
+                callbackInvoker = callbackInvoker,
+                jsObjectIds = normalizedIds
+            )
+        )
+    }
+
+    private fun releaseCollectedJsInterfaceProxy(reference: JsInterfaceProxyReference) {
+        val idsToRelease = mutableListOf<String>()
+        val releaseInvoker: JsInterfaceReleaseInvoker?
+
+        synchronized(jsInterfaceLifecycleLock) {
+            val counts = jsInterfaceReferenceCounts[reference.callbackInvoker]
+            releaseInvoker = jsInterfaceReleaseInvokers[reference.callbackInvoker]
+            if (counts == null) {
+                return
+            }
+
+            reference.jsObjectIds.forEach { jsObjectId ->
+                val remaining = (counts[jsObjectId] ?: 0) - 1
+                if (remaining <= 0) {
+                    counts.remove(jsObjectId)
+                    if (releaseInvoker != null) {
+                        idsToRelease += jsObjectId
+                    }
+                } else {
+                    counts[jsObjectId] = remaining
+                }
+            }
+
+            if (counts.isEmpty()) {
+                jsInterfaceReferenceCounts.remove(reference.callbackInvoker)
+            }
+        }
+
+        if (releaseInvoker == null) {
+            return
+        }
+
+        idsToRelease.forEach { jsObjectId ->
+            try {
+                releaseInvoker.invoke(jsObjectId)
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Failed to auto-release JS interface object $jsObjectId: ${e.message}", e)
+            }
+        }
+    }
+
+    private fun collectJsInterfaceObjectIds(value: Any?, output: MutableSet<String>) {
+        when (value) {
+            is JsInterfaceBinding -> {
+                val normalized = value.jsObjectId.trim()
+                if (normalized.isNotEmpty()) {
+                    output += normalized
+                }
+            }
+            is Map<*, *> -> value.values.forEach { collectJsInterfaceObjectIds(it, output) }
+            is Iterable<*> -> value.forEach { collectJsInterfaceObjectIds(it, output) }
+            is Array<*> -> value.forEach { collectJsInterfaceObjectIds(it, output) }
         }
     }
 
@@ -1071,7 +1215,8 @@ internal object JsJavaBridgeDelegates {
                 ?: proxyInterfaces.firstOrNull()?.classLoader
                 ?: JsJavaBridgeDelegates::class.java.classLoader
 
-        return Proxy.newProxyInstance(loader, proxyInterfaces) { proxy, method, args ->
+        val proxy =
+            Proxy.newProxyInstance(loader, proxyInterfaces) { proxy, method, args ->
             if (method.declaringClass == Any::class.java) {
                 return@newProxyInstance when (method.name) {
                     "toString" ->
@@ -1092,6 +1237,8 @@ internal object JsJavaBridgeDelegates {
                 bridgeClassLoader = bridgeClassLoader
             )
         }
+        trackJsInterfaceProxy(proxy, callbackInvoker, listOf(binding.jsObjectId))
+        return proxy
     }
 
     private fun createJsInterfaceProxyFromMap(
@@ -1122,7 +1269,8 @@ internal object JsJavaBridgeDelegates {
                 ?: targetType.classLoader
                 ?: JsJavaBridgeDelegates::class.java.classLoader
 
-        return Proxy.newProxyInstance(loader, arrayOf(targetType)) { proxy, method, args ->
+        val proxy =
+            Proxy.newProxyInstance(loader, arrayOf(targetType)) { proxy, method, args ->
             if (method.declaringClass == Any::class.java) {
                 return@newProxyInstance when (method.name) {
                     "toString" -> "JsInterfaceProxy(map) implements ${targetType.simpleName}"
@@ -1168,6 +1316,9 @@ internal object JsJavaBridgeDelegates {
                 bridgeClassLoader = bridgeClassLoader
             )
         }
+        val jsObjectIds = linkedSetOf<String>().also { collectJsInterfaceObjectIds(memberMap, it) }
+        trackJsInterfaceProxy(proxy, callbackInvoker, jsObjectIds)
+        return proxy
     }
 
     private fun resolveMapInterfaceMember(

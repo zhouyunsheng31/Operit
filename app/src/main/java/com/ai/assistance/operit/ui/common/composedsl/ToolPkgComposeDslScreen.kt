@@ -91,6 +91,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import android.os.Build
 import java.util.Locale
 
 private const val TAG = "ToolPkgComposeDslScreen"
@@ -176,6 +177,18 @@ fun ToolPkgComposeDslToolScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val renderMutex = remember { Mutex() }
+    val currentLanguage =
+        (
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                context.resources.configuration.locales.get(0)
+            } else {
+                @Suppress("DEPRECATION")
+                context.resources.configuration.locale
+            }
+        )?.toLanguageTag()
+            ?.trim()
+            ?.ifBlank { null }
+            ?: "en"
 
     val packageManager = remember {
         PackageManager.getInstance(context, AIToolHandler.getInstance(context))
@@ -219,6 +232,7 @@ fun ToolPkgComposeDslToolScreen(
             jsEngine.dispatchComposeDslActionAsync(
                 actionId = normalizedActionId,
                 payload = payload,
+                runtimeOptions = mapOf("__operit_package_lang" to currentLanguage),
                 onIntermediateResult = { intermediateResult ->
                     val parsedIntermediate =
                         ToolPkgComposeDslParser.parseRenderResult(intermediateResult)
@@ -297,6 +311,7 @@ fun ToolPkgComposeDslToolScreen(
                                     "packageName" to containerPackageName,
                                     "toolPkgId" to containerPackageName,
                                     "uiModuleId" to uiModuleId,
+                                    "__operit_package_lang" to currentLanguage,
                                     "__operit_script_screen" to (scriptScreenPath ?: ""),
                                     "moduleSpec" to buildModuleSpec(scriptScreenPath),
                                     "state" to (renderResult?.state ?: emptyMap<String, Any?>()),

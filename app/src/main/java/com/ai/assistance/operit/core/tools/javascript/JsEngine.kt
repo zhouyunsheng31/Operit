@@ -1,76 +1,70 @@
 package com.ai.assistance.operit.core.tools.javascript
 
 import android.content.Context
-import com.ai.assistance.operit.util.AppLogger
-import com.ai.assistance.operit.util.LocaleUtils
+import android.graphics.Bitmap
 import android.os.Looper
 import android.webkit.JavascriptInterface
-import android.webkit.WebView
 import androidx.annotation.Keep
 import androidx.core.content.ContextCompat
+import com.ai.assistance.operit.core.application.ActivityLifecycleManager
+import com.ai.assistance.operit.core.chat.logMessageTiming
+import com.ai.assistance.operit.core.chat.messageTimingNow
 import com.ai.assistance.operit.core.tools.AIToolHandler
 import com.ai.assistance.operit.core.tools.packTool.PackageManager
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import org.json.JSONObject
-import org.json.JSONTokener
-import android.graphics.Bitmap
-import com.ai.assistance.operit.core.application.ActivityLifecycleManager
-import com.ai.assistance.operit.core.tools.javascript.JsTimeoutConfig
+import com.ai.assistance.operit.core.tools.packTool.TOOLPKG_EVENT_MESSAGE_PROCESSING
+import com.ai.assistance.operit.util.AppLogger
 import com.ai.assistance.operit.util.ImagePoolManager
+import com.ai.assistance.operit.util.LocaleUtils
 import com.ai.assistance.operit.util.OperitPaths
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
- * JavaScript 引擎 - 通过 WebView 执行 JavaScript 脚本 提供与 Android 原生代码的交互机制
- *
- * 主要功能：
- * 1. 执行 JavaScript 脚本
- * 2. 为脚本提供工具调用能力
- * 3. 集成常用的第三方 JavaScript 库
- *
- * 工具调用使用方式:
- * - 标准模式: toolCall("toolType", "toolName", { param1: "value1" })
- * - 简化模式: toolCall("toolName", { param1: "value1" })
- * - 对象模式: toolCall({ type: "toolType", name: "toolName", params: { param1: "value1" } })
- * - 直接模式: toolCall("toolName")
- *
- * 便捷工具调用:
- * - 文件操作: Tools.Files.read("/path/to/file")
- * - 网络操作: Tools.Net.httpGet("https://example.com")
- * - 系统操作: Tools.System.sleep("1")
- * - 计算功能: Tools.calc("2 + 2 * 3")
- *
- * 完成脚本执行:
- * - complete(result) 函数传递最终结果返回给调用者
+ * JavaScript 引擎 - 通过 QuickJS 执行 JavaScript 脚本并提供与 Android 原生代码的交互机制
  */
 class JsEngine(private val context: Context) {
     companion object {
         private const val TAG = "JsEngine"
         private const val TOOLPKG_TAG = "ToolPkg"
-        private const val BINARY_DATA_THRESHOLD = 32 * 1024 // 32KB
+        private const val BINARY_DATA_THRESHOLD = 32 * 1024
         private const val BINARY_HANDLE_PREFIX = "@binary_handle:"
     }
 
-    // 存储原生Bitmap对象的注册表
     private val bitmapRegistry = ConcurrentHashMap<String, Bitmap>()
-    // 存储大型二进制数据的注册表
     private val binaryDataRegistry = ConcurrentHashMap<String, ByteArray>()
-    // 存储 Java/Kotlin 桥接对象实例
     private val javaObjectRegistry = ConcurrentHashMap<String, Any>()
+    private val externalJavaCodeLoader = JsExternalJavaCodeLoader(context)
 
-    // WebView 实例用于执行 JavaScript
-    private var webView: WebView? = null
-
-    // 工具处理器
     private val toolHandler = AIToolHandler.getInstance(context)
     private val packageManager by lazy { PackageManager.getInstance(context, toolHandler) }
-
-    // 工具调用接口
     private val toolCallInterface = JsToolCallInterface()
+
+    @Volatile
+    private var quickJsThread: Thread? = null
+
+    private val quickJsExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "OperitQuickJsEngine").apply {
+            isDaemon = true
+            quickJsThread = this
+        }
+    }
+    private val quickJsDispatcher = quickJsExecutor.asCoroutineDispatcher()
+    private val engineScope = CoroutineScope(SupervisorJob() + quickJsDispatcher)
+    private val quickJsInitLock = Any()
+
+    @Volatile
+    private var quickJs: OperitQuickJsEngine? = null
 
     private data class ExecutionSession(
         val callId: String,
@@ -81,11 +75,6 @@ class JsEngine(private val context: Context) {
     )
 
     private val activeExecutionSessions = ConcurrentHashMap<String, ExecutionSession>()
-
-    // 用于存储工具调用的回调
-    private val toolCallbacks = ConcurrentHashMap<String, CompletableFuture<String>>()
-
-    // 标记 JS 环境是否已初始化
     private var jsEnvironmentInitialized = false
 
     private val toolPkgExecutionContext = JsToolPkgExecutionContext()
@@ -119,66 +108,81 @@ class JsEngine(private val context: Context) {
         return toolPkgExecutionContext.hasTemporaryTextResourceResolver()
     }
 
-    // 初始化 WebView
-    private fun initWebView() {
-        if (webView == null) {
-            // 需要在主线程创建 WebView
-            val latch = CountDownLatch(1)
-            ContextCompat.getMainExecutor(context).execute {
-                try {
-                    webView =
-                            WebView(context).apply {
-                                settings.javaScriptEnabled = true
-                                settings.domStorageEnabled = true // 允许访问 sessionStorage 和 localStorage
-
-                                // 为了安全，禁用文件系统访问，除非显式通过工具提供
-                                settings.allowFileAccess = false
-                                settings.allowContentAccess = false
-
-                                // 设置User Agent
-                                settings.userAgentString = "Operit-JsEngine/1.0"
-                                addJavascriptInterface(toolCallInterface, "NativeInterface")
-                                // 加载一个带有有效基地址的空HTML页面，以解决 about:blank 的源安全问题
-                                loadDataWithBaseURL("https://localhost", "<html></html>", "text/html", "UTF-8", null)
-                            }
-                    latch.countDown()
-                } catch (e: Exception) {
-                    AppLogger.e(TAG, "Error initializing WebView: ${e.message}", e)
-                    latch.countDown()
-                }
-            }
-            latch.await(10, TimeUnit.SECONDS)
-        }
-    }
-
-    private fun getComposeDslContextBridgeDefinition(): String {
-        return buildComposeDslContextBridgeDefinition()
-    }
-
-    private fun getJavaClassBridgeDefinition(): String {
-        return buildJavaClassBridgeDefinition()
-    }
-
-    private fun getJavaBridgeClassLoader(): ClassLoader {
+    private fun getJavaBridgeBaseClassLoader(): ClassLoader {
         return context.classLoader
             ?: this::class.java.classLoader
             ?: ClassLoader.getSystemClassLoader()
     }
 
-    private fun decodeEvaluateJavascriptResult(raw: String?): String {
-        if (raw.isNullOrBlank() || raw == "null") {
-            return ""
-        }
-        return try {
-            val token = JSONTokener(raw).nextValue()
-            when (token) {
-                is String -> token
-                else -> token?.toString().orEmpty()
+    private fun getJavaBridgeClassLoader(): ClassLoader {
+        return externalJavaCodeLoader.getEffectiveClassLoader(getJavaBridgeBaseClassLoader())
+    }
+
+    private fun <T> runOnQuickJsThreadBlocking(block: () -> T): T {
+        return if (Thread.currentThread() === quickJsThread) {
+            block()
+        } else {
+            runBlocking(quickJsDispatcher) {
+                block()
             }
-        } catch (_: Exception) {
-            raw
         }
     }
+
+    private fun ensureQuickJs() {
+        if (quickJs != null) {
+            return
+        }
+        synchronized(quickJsInitLock) {
+            if (quickJs != null) {
+                return
+            }
+            try {
+                val engine = runOnQuickJsThreadBlocking {
+                    OperitQuickJsEngine().also {
+                        it.bindNativeInterface(toolCallInterface)
+                    }
+                }
+                quickJs = engine
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error initializing QuickJS: ${e.message}", e)
+                throw e
+            }
+        }
+    }
+
+    private fun <T> evaluateQuickJsBlocking(script: String, fileName: String = "<eval>"): T? {
+        ensureQuickJs()
+        val engine = quickJs ?: return null
+        return if (Thread.currentThread() === quickJsThread) {
+            runBlocking {
+                engine.evaluate<T>(script, fileName)
+            }
+        } else {
+            runBlocking(quickJsDispatcher) {
+                engine.evaluate<T>(script, fileName)
+            }
+        }
+    }
+
+    private fun launchQuickJsEvaluation(
+        script: String,
+        fileName: String = "<eval>",
+        onError: ((Exception) -> Unit)? = null
+    ) {
+        val engine = quickJs ?: return
+        engineScope.launch {
+            try {
+                engine.evaluate<Any?>(script, fileName)
+            } catch (e: Exception) {
+                if (onError != null) {
+                    onError(e)
+                } else {
+                    AppLogger.e(TAG, "QuickJS evaluation failed: ${e.message}", e)
+                }
+            }
+        }
+    }
+
 
     private fun nextExecutionCallId(): String {
         return "operit_call_${UUID.randomUUID().toString().replace("-", "")}" 
@@ -224,24 +228,26 @@ class JsEngine(private val context: Context) {
     }
 
     private fun cancelExecutionSessionInJs(callId: String, reason: String) {
+        ensureQuickJs()
         val safeCallId = JSONObject.quote(callId)
         val safeReason = JSONObject.quote(reason)
-        ContextCompat.getMainExecutor(context).execute {
-            try {
-                webView?.evaluateJavascript(
-                    """
-                        (function() {
-                            if (typeof window.__operitCancelCallSession === 'function') {
-                                window.__operitCancelCallSession($safeCallId, $safeReason);
-                            }
-                        })();
-                    """.trimIndent(),
-                    null
-                )
-            } catch (e: Exception) {
+        launchQuickJsEvaluation(
+            script =
+                """
+                    (function() {
+                        var root = typeof globalThis !== 'undefined'
+                            ? globalThis
+                            : (typeof window !== 'undefined' ? window : this);
+                        if (typeof root.__operitCancelCallSession === 'function') {
+                            root.__operitCancelCallSession($safeCallId, $safeReason);
+                        }
+                    })();
+                """.trimIndent(),
+            fileName = "quickjs/runtime/cancel-call-session.js",
+            onError = { e ->
                 AppLogger.e(TAG, "Error canceling JS execution session $callId: ${e.message}", e)
             }
-        }
+        )
     }
 
     private fun withToolPkgPluginTag(message: String): String {
@@ -252,12 +258,93 @@ class JsEngine(private val context: Context) {
         return toolPkgExecutionContext.withPluginTag(session?.toolPkgLogSnapshot, message)
     }
 
-    private fun withToolPkgCodeContext(message: String): String {
-        return toolPkgExecutionContext.withCodeContext(null, message)
-    }
-
     private fun withToolPkgCodeContext(session: ExecutionSession?, message: String): String {
         return toolPkgExecutionContext.withCodeContext(session?.toolPkgLogSnapshot, message)
+    }
+
+    private fun runtimeBootstrapModules(): List<JsBootstrapModule> {
+        return buildRuntimeBootstrapModules(
+            context = context,
+            operitDownloadDir = OperitPaths.operitRootPathSdcard(),
+            operitCleanOnExitDir = OperitPaths.cleanOnExitPathSdcard()
+        )
+    }
+
+    private fun evaluateBootstrapModule(module: JsBootstrapModule) {
+        if (module.source.isBlank()) {
+            return
+        }
+        try {
+            evaluateQuickJsBlocking<Any?>(module.source, module.fileName)
+            exposeBootstrapGlobals(module)
+        } catch (e: Exception) {
+            val globalsSummary = module.globals.joinToString(prefix = "[", postfix = "]")
+            AppLogger.e(
+                TAG,
+                "Bootstrap module failed: file=${module.fileName}, scriptLength=${module.source.length}, globals=$globalsSummary, preview=${summarizeJavaScriptForLog(module.source)}",
+                e
+            )
+            throw IllegalStateException("Bootstrap failed for ${module.fileName}: ${e.message}", e)
+        }
+    }
+
+    private fun summarizeJavaScriptForLog(source: String, maxLength: Int = 320): String {
+        if (source.isBlank()) {
+            return ""
+        }
+        val normalized =
+            buildString(source.length) {
+                source.forEach { ch ->
+                    append(
+                        when (ch) {
+                            '\n', '\r', '\t' -> ' '
+                            else -> ch
+                        }
+                    )
+                }
+            }.trim()
+        return if (normalized.length <= maxLength) {
+            normalized
+        } else {
+            normalized.take(maxLength - 3) + "..."
+        }
+    }
+
+    private fun exposeBootstrapGlobals(module: JsBootstrapModule) {
+        if (module.globals.isEmpty()) {
+            return
+        }
+        evaluateQuickJsBlocking<Any?>(
+            buildBootstrapGlobalExposureScript(module.globals),
+            "${module.fileName}#globals"
+        )
+    }
+
+    private fun buildBootstrapGlobalExposureScript(globalNames: List<String>): String {
+        val exposeStatements =
+            globalNames.joinToString("\n") { name ->
+                val quotedName = JSONObject.quote(name)
+                "expose($quotedName, typeof $name !== 'undefined' ? $name : undefined);"
+            }
+
+        return """
+            (function() {
+                var root = typeof globalThis !== 'undefined'
+                    ? globalThis
+                    : (typeof window !== 'undefined' ? window : this);
+                var expose = typeof root.__operitExpose === 'function'
+                    ? root.__operitExpose
+                    : function(name, value) {
+                        var key = String(name || '').trim();
+                        if (!key || value === undefined) {
+                            return;
+                        }
+                        try { root[key] = value; } catch (_error) {}
+                        try { window[key] = value; } catch (_error2) {}
+                    };
+                $exposeStatements
+            })();
+        """.trimIndent()
     }
 
     private fun invokeJavaBridgeJsObjectCallbackSync(
@@ -272,11 +359,11 @@ class JsEngine(private val context: Context) {
                 .toString()
         }
 
-        val targetWebView = webView
-        if (targetWebView == null) {
+        ensureQuickJs()
+        if (quickJs == null) {
             return JSONObject()
                 .put("success", false)
-                .put("error", "webview is not initialized")
+                .put("error", "quickjs is not initialized")
                 .toString()
         }
 
@@ -313,44 +400,69 @@ class JsEngine(private val context: Context) {
             })();
             """.trimIndent()
 
-        val latch = CountDownLatch(1)
-        var decodedResult: String? = null
-
-        ContextCompat.getMainExecutor(context).execute {
-            try {
-                targetWebView.evaluateJavascript(callbackScript) { raw ->
-                    decodedResult = decodeEvaluateJavascriptResult(raw)
-                    latch.countDown()
-                }
-            } catch (e: Exception) {
-                decodedResult =
-                    JSONObject()
-                        .put("success", false)
-                        .put("error", "java bridge callback evaluation failed: ${e.message}")
-                        .toString()
-                latch.countDown()
-            }
-        }
-
         return try {
-            if (!latch.await(6, TimeUnit.SECONDS)) {
-                JSONObject()
-                    .put("success", false)
-                    .put("error", "java bridge callback timed out")
-                    .toString()
-            } else {
-                decodedResult
-                    ?: JSONObject()
-                        .put("success", false)
-                        .put("error", "java bridge callback returned empty result")
-                        .toString()
-            }
-        } catch (e: InterruptedException) {
-            Thread.currentThread().interrupt()
+            val callbackResult =
+                evaluateQuickJsBlocking<String>(
+                    script = callbackScript,
+                    fileName = "quickjs/runtime/java-bridge-callback.js"
+                )
+            callbackResult ?: JSONObject()
+                .put("success", false)
+                .put("error", "java bridge callback returned empty result")
+                .toString()
+        } catch (e: Exception) {
             JSONObject()
                 .put("success", false)
-                .put("error", "java bridge callback interrupted: ${e.message}")
+                .put("error", "java bridge callback evaluation failed: ${e.message}")
                 .toString()
+        }
+    }
+
+    private fun releaseJavaBridgeJsObjectSync(jsObjectId: String): Boolean {
+        val normalizedId = jsObjectId.trim()
+        if (normalizedId.isEmpty() || !jsEnvironmentInitialized) {
+            return false
+        }
+
+        ensureQuickJs()
+        if (quickJs == null) {
+            return false
+        }
+
+        val releaseScript =
+            """
+            (function() {
+                try {
+                    var __release =
+                        (typeof globalThis !== 'undefined' && typeof globalThis.__operitJavaBridgeReleaseJsObject === 'function')
+                            ? globalThis.__operitJavaBridgeReleaseJsObject
+                            : undefined;
+                    if (!__release) {
+                        return false;
+                    }
+                    return !!__release(${JSONObject.quote(normalizedId)});
+                } catch (_error) {
+                    return false;
+                }
+            })();
+            """.trimIndent()
+
+        return try {
+            when (
+                val result =
+                    evaluateQuickJsBlocking<Any?>(
+                        script = releaseScript,
+                        fileName = "quickjs/runtime/java-bridge-release.js"
+                    )
+            ) {
+                is Boolean -> result
+                is String -> result.equals("true", ignoreCase = true)
+                is Number -> result.toInt() != 0
+                else -> false
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to auto-release JS interface object $normalizedId: ${e.message}", e)
+            false
         }
     }
 
@@ -377,75 +489,22 @@ class JsEngine(private val context: Context) {
         }
     }
 
-    /** 初始化 JavaScript 环境 加载核心功能、工具库和辅助函数 这些代码只需要执行一次 */
+    /** 初始化 JavaScript 环境，加上 QuickJS 兼容层、核心运行时与工具桥 */
     private fun initJavaScriptEnvironment() {
         if (jsEnvironmentInitialized) {
-            return // 如果已经初始化，直接返回
+            return
         }
 
-        val operitDownloadDir = OperitPaths.operitRootPathSdcard()
-        val operitCleanOnExitDir = OperitPaths.cleanOnExitPathSdcard()
-
-        val initScript =
-            buildInitRuntimeScript(
-                operitDownloadDir = operitDownloadDir,
-                operitCleanOnExitDir = operitCleanOnExitDir,
-                toolPkgRegistrationBridgeScript = buildToolPkgRegistrationBridgeScript(),
-                jsToolsDefinition = getJsToolsDefinition(),
-                composeDslContextBridgeDefinition = getComposeDslContextBridgeDefinition(),
-                javaClassBridgeDefinition = getJavaClassBridgeDefinition(),
-                jsThirdPartyLibraries = getJsThirdPartyLibraries(),
-                cryptoJsBridgeScript = loadCryptoJs(context),
-                jimpJsBridgeScript = loadJimpJs(context),
-                uiNodeJsScript = loadUINodeJs(context),
-                androidUtilsJsScript = loadAndroidUtilsJs(context),
-                okHttp3JsScript = loadOkHttp3Js(context),
-                pakoJsBridgeScript = loadPakoJs(context)
-            )
-
-        // 在 WebView 中执行初始化脚本
-        val initLatch = CountDownLatch(1)
-        ContextCompat.getMainExecutor(context).execute {
-            try {
-                webView?.evaluateJavascript(initScript) { result ->
-                    AppLogger.d(TAG, "JS environment initialization completed: $result")
-                    try {
-                        webView?.evaluateJavascript(
-                            "typeof __operitRegisterCallSession === 'function' && typeof __operitGetCallState === 'function'"
-                        ) { checkResult ->
-                            val isRuntimeReady = checkResult == "true"
-                            if (isRuntimeReady) {
-                                jsEnvironmentInitialized = true
-                            } else {
-                                jsEnvironmentInitialized = false
-                                AppLogger.e(
-                                    TAG,
-                                    "JS call runtime bridge is not ready after initialization. Result: $checkResult"
-                                )
-                            }
-                            initLatch.countDown()
-                        }
-                    } catch (e: Exception) {
-                        AppLogger.e(TAG, "Failed to verify JS call runtime bridge after initialization: ${e.message}", e)
-                        jsEnvironmentInitialized = false
-                        initLatch.countDown()
-                    }
-                }
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Failed to initialize JS environment: ${e.message}", e)
-                jsEnvironmentInitialized = false
-                initLatch.countDown()
-            }
-        }
-
-        // 等待初始化完成，使用超时避免无限等待
+        ensureQuickJs()
         try {
-            if (!initLatch.await(10, TimeUnit.SECONDS)) {
-                AppLogger.w(TAG, "JS environment initialization timeout after 10 seconds")
-            }
-        } catch (e: InterruptedException) {
-            AppLogger.e(TAG, "JS environment initialization interrupted", e)
-            Thread.currentThread().interrupt()
+            runtimeBootstrapModules().forEach(::evaluateBootstrapModule)
+            jsEnvironmentInitialized = true
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "Failed to initialize JS environment: ${e.message}", e)
+            jsEnvironmentInitialized = false
+        }
+        if (!jsEnvironmentInitialized) {
+            AppLogger.e(TAG, "QuickJS init script failed to produce runtime bridge")
         }
     }
 
@@ -471,9 +530,36 @@ class JsEngine(private val context: Context) {
                 LocaleUtils.getCurrentLanguage(context).trim().ifBlank { "en" }
         }
 
-        initWebView()
+        val timingEvent = effectiveParams["event"]?.toString()?.trim().orEmpty()
+        val timingPluginId =
+            effectiveParams["pluginId"]?.toString()?.trim().orEmpty()
+                .ifBlank {
+                    effectiveParams["__operit_plugin_id"]?.toString()?.trim().orEmpty()
+                }
+                .ifBlank { "none" }
+        val shouldLogTiming = timingEvent.equals(TOOLPKG_EVENT_MESSAGE_PROCESSING, ignoreCase = true)
+        val totalStartTime = if (shouldLogTiming) messageTimingNow() else 0L
+
+        val initQuickJsStartTime = if (shouldLogTiming) messageTimingNow() else 0L
+        ensureQuickJs()
+        if (shouldLogTiming) {
+            logMessageTiming(
+                stage = "toolpkg.jsEngine.initQuickJs",
+                startTimeMs = initQuickJsStartTime,
+                details = "function=$functionName, plugin=$timingPluginId"
+            )
+        }
+
         if (!jsEnvironmentInitialized) {
+            val initJavaScriptEnvironmentStartTime = if (shouldLogTiming) messageTimingNow() else 0L
             initJavaScriptEnvironment()
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.jsEngine.initJavaScriptEnvironment",
+                    startTimeMs = initJavaScriptEnvironmentStartTime,
+                    details = "function=$functionName, plugin=$timingPluginId"
+                )
+            }
         }
 
         val callId = nextExecutionCallId()
@@ -488,6 +574,7 @@ class JsEngine(private val context: Context) {
             )
         activeExecutionSessions[callId] = session
 
+        val buildExecutionScriptStartTime = if (shouldLogTiming) messageTimingNow() else 0L
         val paramsJson = JSONObject(effectiveParams).toString()
         val scriptJson = JSONObject.quote(script)
         val functionNameJson = JSONObject.quote(functionName)
@@ -501,16 +588,18 @@ class JsEngine(private val context: Context) {
                 timeoutSec = timeoutSec,
                 preTimeoutSeconds = JsTimeoutConfig.PRE_TIMEOUT_SECONDS
             )
+        if (shouldLogTiming) {
+            logMessageTiming(
+                stage = "toolpkg.jsEngine.buildExecutionScript",
+                startTimeMs = buildExecutionScriptStartTime,
+                details = "function=$functionName, plugin=$timingPluginId, scriptLength=${script.length}, paramsLength=${paramsJson.length}"
+            )
+        }
 
-        ContextCompat.getMainExecutor(context).execute {
-            try {
-                webView?.evaluateJavascript(executionScript) { result ->
-                    AppLogger.d(
-                        TAG,
-                        "Script execution dispatched: callId=$callId, function=$functionName, syncResult=$result"
-                    )
-                }
-            } catch (e: Exception) {
+        launchQuickJsEvaluation(
+            script = executionScript,
+            fileName = "quickjs/runtime/execute-script.js",
+            onError = { e ->
                 AppLogger.e(
                     TAG,
                     "Failed to dispatch script execution: callId=$callId, function=$functionName, reason=${e.message}",
@@ -521,9 +610,10 @@ class JsEngine(private val context: Context) {
                     session.future.complete("Error: ${e.message ?: "dispatch failed"}")
                 }
             }
-        }
+        )
 
         val preTimeoutTimer = java.util.Timer()
+        val waitResultStartTime = if (shouldLogTiming) messageTimingNow() else 0L
         return try {
             preTimeoutTimer.schedule(
                 object : java.util.TimerTask() {
@@ -542,6 +632,18 @@ class JsEngine(private val context: Context) {
             val safeTimeoutSec = if (timeoutSec <= 0L) 1L else timeoutSec
             val result = session.future.get(safeTimeoutSec, TimeUnit.SECONDS)
             removeExecutionSession(callId)
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.jsEngine.waitResult",
+                    startTimeMs = waitResultStartTime,
+                    details = "function=$functionName, plugin=$timingPluginId, callId=$callId, success=true, resultType=${result?.javaClass?.simpleName ?: "null"}"
+                )
+                logMessageTiming(
+                    stage = "toolpkg.jsEngine.total",
+                    startTimeMs = totalStartTime,
+                    details = "function=$functionName, plugin=$timingPluginId, callId=$callId, success=true"
+                )
+            }
             result
         } catch (e: Exception) {
             if (e is InterruptedException) {
@@ -560,6 +662,18 @@ class JsEngine(private val context: Context) {
             )
             removeExecutionSession(callId)
             cancelExecutionSessionInJs(callId, failureReason)
+            if (shouldLogTiming) {
+                logMessageTiming(
+                    stage = "toolpkg.jsEngine.waitResult",
+                    startTimeMs = waitResultStartTime,
+                    details = "function=$functionName, plugin=$timingPluginId, callId=$callId, success=false, reason=$failureReason"
+                )
+                logMessageTiming(
+                    stage = "toolpkg.jsEngine.total",
+                    startTimeMs = totalStartTime,
+                    details = "function=$functionName, plugin=$timingPluginId, callId=$callId, success=false, reason=$failureReason"
+                )
+            }
             "Error: $failureReason"
         } finally {
             preTimeoutTimer.cancel()
@@ -604,6 +718,7 @@ class JsEngine(private val context: Context) {
     fun executeComposeDslAction(
             actionId: String,
             payload: Any? = null,
+            runtimeOptions: Map<String, Any?> = emptyMap(),
             envOverrides: Map<String, String> = emptyMap(),
             onIntermediateResult: ((Any?) -> Unit)? = null
     ): Any? {
@@ -611,7 +726,8 @@ class JsEngine(private val context: Context) {
         if (normalizedActionId.isBlank()) {
             return "Error: compose action id is required"
         }
-        val params = mutableMapOf<String, Any?>("__action_id" to normalizedActionId)
+        val params = runtimeOptions.toMutableMap()
+        params["__action_id"] = normalizedActionId
         if (payload != null) {
             params["__action_payload"] = payload
         }
@@ -627,6 +743,7 @@ class JsEngine(private val context: Context) {
     fun dispatchComposeDslActionAsync(
             actionId: String,
             payload: Any? = null,
+            runtimeOptions: Map<String, Any?> = emptyMap(),
             envOverrides: Map<String, String> = emptyMap(),
             onIntermediateResult: ((Any?) -> Unit)? = null,
             onComplete: (() -> Unit)? = null,
@@ -645,6 +762,7 @@ class JsEngine(private val context: Context) {
                     executeComposeDslAction(
                         actionId = normalizedActionId,
                         payload = payload,
+                        runtimeOptions = runtimeOptions,
                         envOverrides = envOverrides,
                         onIntermediateResult = onIntermediateResult
                     )
@@ -690,44 +808,55 @@ class JsEngine(private val context: Context) {
     private fun resetState(cancellationMessage: String = "Execution canceled: new execution started") {
         cancelAllExecutionSessions(cancellationMessage)
 
-        toolCallbacks.forEach { (_, future) ->
-            if (!future.isDone) {
-                future.complete("Operation canceled: engine reset")
-            }
-        }
-        toolCallbacks.clear()
-
         bitmapRegistry.values.forEach { it.recycle() }
         bitmapRegistry.clear()
 
         binaryDataRegistry.clear()
         javaObjectRegistry.clear()
-
-        if (webView != null) {
-            ContextCompat.getMainExecutor(context).execute {
-                try {
-                    webView?.evaluateJavascript(
-                            """
+        if (quickJs != null) {
+            launchQuickJsEvaluation(
+                script =
+                    """
                         (function() {
-                            var highestTimeoutId = setTimeout(";");
-                            for (var i = 0 ; i < highestTimeoutId ; i++) {
-                                clearTimeout(i);
-                                clearInterval(i);
+                            var root = typeof globalThis !== 'undefined'
+                                ? globalThis
+                                : (typeof window !== 'undefined' ? window : this);
+                            if (typeof root.__operitClearAllTimers === 'function') {
+                                root.__operitClearAllTimers();
                             }
                         })();
-                    """,
-                            null
-                    )
-                } catch (e: Exception) {
-                    AppLogger.e(TAG, "Error in WebView cleanup: ${e.message}", e)
+                    """.trimIndent(),
+                fileName = "quickjs/runtime/reset-state.js",
+                onError = { e ->
+                    AppLogger.e(TAG, "Error in QuickJS cleanup: ${e.message}", e)
                 }
-            }
+            )
         }
     }
 
     /** JavaScript 接口，提供 Native 调用方法 */
     @Keep
     inner class JsToolCallInterface {
+
+        private val jsBridgeCallbackInvoker: (String, String, String) -> String =
+            { jsObjectId, methodName, callbackArgsJson ->
+                invokeJavaBridgeJsObjectCallbackSync(
+                    jsObjectId = jsObjectId,
+                    methodName = methodName,
+                    argsJson = callbackArgsJson
+                )
+            }
+
+        init {
+            JsJavaBridgeDelegates.registerJsInterfaceReleaseInvoker(
+                callbackInvoker = jsBridgeCallbackInvoker,
+                releaseInvoker = ::releaseJavaBridgeJsObjectSync
+            )
+        }
+
+        fun detachJavaBridgeLifecycle() {
+            JsJavaBridgeDelegates.unregisterJsInterfaceReleaseInvoker(jsBridgeCallbackInvoker)
+        }
 
         @JavascriptInterface
         fun decompress(data: String, algorithm: String): String {
@@ -913,61 +1042,107 @@ class JsEngine(private val context: Context) {
             toolPkgRegistrationSession.appendPromptFinalizeHook(specJson)
         }
 
+        private fun bridgeClassLoader(): ClassLoader = getJavaBridgeClassLoader()
+
+        private fun exposeJavaObject(target: Any, failureLabel: String): String {
+            return try {
+                val handle = UUID.randomUUID().toString()
+                javaObjectRegistry[handle] = target
+                JSONObject()
+                    .put("success", true)
+                    .put(
+                        "data",
+                        JSONObject()
+                            .put("__javaHandle", handle)
+                            .put("__javaClass", target.javaClass.name)
+                    )
+                    .toString()
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "$failureLabel: ${e.message}", e)
+                JSONObject()
+                    .put("success", false)
+                    .put("error", e.message ?: failureLabel.lowercase())
+                    .toString()
+            }
+        }
+
+        private fun launchSuspendJavaBridgeCall(
+            callbackId: String,
+            block: (normalizedCallbackId: String, resultCallback: (String) -> Unit) -> Unit
+        ) {
+            val normalizedCallback = callbackId.trim()
+            if (normalizedCallback.isEmpty()) {
+                return
+            }
+            Thread {
+                block(
+                    normalizedCallback,
+                    createSuspendJavaBridgeResultCallback(normalizedCallback)
+                )
+            }.start()
+        }
+
+        private fun createSuspendJavaBridgeResultCallback(callbackId: String): (String) -> Unit {
+            return { resultJson ->
+                val (error, data) = splitBridgeResult(resultJson)
+                invokeJavaBridgeJsObjectCallbackSync(
+                    jsObjectId = callbackId,
+                    methodName = "",
+                    argsJson = JSONArray().put(error).put(data).toString()
+                )
+            }
+        }
+
         @JavascriptInterface
         fun javaClassExists(className: String): Boolean {
-            return JsJavaBridgeDelegates.classExists(className = className)
+            return JsJavaBridgeDelegates.classExists(
+                className = className,
+                bridgeClassLoader = bridgeClassLoader()
+            )
+        }
+
+        @JavascriptInterface
+        fun javaLoadDex(path: String, optionsJson: String): String {
+            return externalJavaCodeLoader.loadDex(
+                path = path,
+                optionsJson = optionsJson,
+                baseClassLoader = getJavaBridgeBaseClassLoader()
+            )
+        }
+
+        @JavascriptInterface
+        fun javaLoadJar(path: String, optionsJson: String): String {
+            return externalJavaCodeLoader.loadJar(
+                path = path,
+                optionsJson = optionsJson,
+                baseClassLoader = getJavaBridgeBaseClassLoader()
+            )
+        }
+
+        @JavascriptInterface
+        fun javaListLoadedCodePaths(): String {
+            return externalJavaCodeLoader.listLoadedArtifacts()
         }
 
         @JavascriptInterface
         fun javaGetApplicationContext(): String {
-            return try {
-                val appContext = context.applicationContext
-                val handle = UUID.randomUUID().toString()
-                javaObjectRegistry[handle] = appContext
-
-                JSONObject()
-                    .put("success", true)
-                    .put(
-                        "data",
-                        JSONObject()
-                            .put("__javaHandle", handle)
-                            .put("__javaClass", appContext.javaClass.name)
-                    )
-                    .toString()
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Failed to expose application context: ${e.message}", e)
-                JSONObject()
-                    .put("success", false)
-                    .put("error", e.message ?: "failed to expose application context")
-                    .toString()
-            }
+            return exposeJavaObject(
+                target = context.applicationContext,
+                failureLabel = "Failed to expose application context"
+            )
         }
 
         @JavascriptInterface
         fun javaGetCurrentActivity(): String {
-            return try {
-                val activity =
-                    ActivityLifecycleManager.getCurrentActivity()
-                        ?: throw IllegalStateException("current activity is null")
-                val handle = UUID.randomUUID().toString()
-                javaObjectRegistry[handle] = activity
-
-                JSONObject()
-                    .put("success", true)
-                    .put(
-                        "data",
-                        JSONObject()
-                            .put("__javaHandle", handle)
-                            .put("__javaClass", activity.javaClass.name)
-                    )
-                    .toString()
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Failed to expose current activity: ${e.message}", e)
-                JSONObject()
+            val activity = ActivityLifecycleManager.getCurrentActivity()
+                ?: return JSONObject()
                     .put("success", false)
-                    .put("error", e.message ?: "failed to expose current activity")
+                    .put("error", "current activity is null")
                     .toString()
-            }
+            return exposeJavaObject(
+                target = activity,
+                failureLabel = "Failed to expose current activity"
+            )
         }
 
         @JavascriptInterface
@@ -976,14 +1151,8 @@ class JsEngine(private val context: Context) {
                     className = className,
                     argsJson = argsJson,
                     objectRegistry = javaObjectRegistry,
-                    jsCallbackInvoker = { jsObjectId, methodName, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = methodName,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
             )
         }
 
@@ -994,14 +1163,8 @@ class JsEngine(private val context: Context) {
                     methodName = methodName,
                     argsJson = argsJson,
                     objectRegistry = javaObjectRegistry,
-                    jsCallbackInvoker = { jsObjectId, callbackMethod, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = callbackMethod,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
             )
         }
 
@@ -1012,14 +1175,8 @@ class JsEngine(private val context: Context) {
                     methodName = methodName,
                     argsJson = argsJson,
                     objectRegistry = javaObjectRegistry,
-                    jsCallbackInvoker = { jsObjectId, callbackMethod, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = callbackMethod,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
             )
         }
 
@@ -1030,39 +1187,17 @@ class JsEngine(private val context: Context) {
                 argsJson: String,
                 callbackId: String
         ) {
-            val normalizedCallback = callbackId.trim()
-            if (normalizedCallback.isEmpty()) {
-                return
-            }
-            Thread {
+            launchSuspendJavaBridgeCall(callbackId) { _normalizedCallback, resultCallback ->
                 JsJavaBridgeDelegates.callStaticSuspend(
                     className = className,
                     methodName = methodName,
                     argsJson = argsJson,
                     objectRegistry = javaObjectRegistry,
-                    callback = { resultJson ->
-                        val (error, data) = splitBridgeResult(resultJson)
-                        val argsJsonPayload =
-                            JSONArray()
-                                .put(error)
-                                .put(data)
-                                .toString()
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = normalizedCallback,
-                            methodName = "",
-                            argsJson = argsJsonPayload
-                        )
-                    },
-                    jsCallbackInvoker = { jsObjectId, callbackMethod, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = callbackMethod,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    callback = resultCallback,
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
                 )
-            }.start()
+            }
         }
 
         @JavascriptInterface
@@ -1072,39 +1207,17 @@ class JsEngine(private val context: Context) {
                 argsJson: String,
                 callbackId: String
         ) {
-            val normalizedCallback = callbackId.trim()
-            if (normalizedCallback.isEmpty()) {
-                return
-            }
-            Thread {
+            launchSuspendJavaBridgeCall(callbackId) { _normalizedCallback, resultCallback ->
                 JsJavaBridgeDelegates.callInstanceSuspend(
                     instanceHandle = instanceHandle,
                     methodName = methodName,
                     argsJson = argsJson,
                     objectRegistry = javaObjectRegistry,
-                    callback = { resultJson ->
-                        val (error, data) = splitBridgeResult(resultJson)
-                        val argsJsonPayload =
-                            JSONArray()
-                                .put(error)
-                                .put(data)
-                                .toString()
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = normalizedCallback,
-                            methodName = "",
-                            argsJson = argsJsonPayload
-                        )
-                    },
-                    jsCallbackInvoker = { jsObjectId, callbackMethod, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = callbackMethod,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    callback = resultCallback,
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
                 )
-            }.start()
+            }
         }
 
         @JavascriptInterface
@@ -1112,7 +1225,8 @@ class JsEngine(private val context: Context) {
             return JsJavaBridgeDelegates.getStaticField(
                     className = className,
                     fieldName = fieldName,
-                    objectRegistry = javaObjectRegistry
+                    objectRegistry = javaObjectRegistry,
+                    bridgeClassLoader = bridgeClassLoader()
             )
         }
 
@@ -1123,14 +1237,8 @@ class JsEngine(private val context: Context) {
                     fieldName = fieldName,
                     valueJson = valueJson,
                     objectRegistry = javaObjectRegistry,
-                    jsCallbackInvoker = { jsObjectId, callbackMethod, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = callbackMethod,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
             )
         }
 
@@ -1150,28 +1258,15 @@ class JsEngine(private val context: Context) {
                     fieldName = fieldName,
                     valueJson = valueJson,
                     objectRegistry = javaObjectRegistry,
-                    jsCallbackInvoker = { jsObjectId, callbackMethod, callbackArgsJson ->
-                        invokeJavaBridgeJsObjectCallbackSync(
-                            jsObjectId = jsObjectId,
-                            methodName = callbackMethod,
-                            argsJson = callbackArgsJson
-                        )
-                    },
-                    bridgeClassLoader = getJavaBridgeClassLoader()
+                    jsCallbackInvoker = jsBridgeCallbackInvoker,
+                    bridgeClassLoader = bridgeClassLoader()
             )
         }
 
         @JavascriptInterface
-        fun javaReleaseInstance(instanceHandle: String): String {
+        fun __javaReleaseInstanceInternal(instanceHandle: String): String {
             return JsJavaBridgeDelegates.releaseInstance(
                     instanceHandle = instanceHandle,
-                    objectRegistry = javaObjectRegistry
-            )
-        }
-
-        @JavascriptInterface
-        fun javaReleaseAllInstances(): String {
-            return JsJavaBridgeDelegates.releaseAllInstances(
                     objectRegistry = javaObjectRegistry
             )
         }
@@ -1281,18 +1376,22 @@ class JsEngine(private val context: Context) {
 
         /** 向JavaScript发送工具调用结果 */
         private fun sendToolResult(callbackId: String, result: String, isError: Boolean) {
-            ContextCompat.getMainExecutor(context).execute {
-                try {
-                    val jsCode =
-                        JsNativeInterfaceDelegates.buildToolResultCallbackScript(
-                            callbackId = callbackId,
-                            result = result,
-                            isError = isError
-                        )
-                    webView?.evaluateJavascript(jsCode, null)
-                } catch (e: Exception) {
-                    AppLogger.e(TAG, "Error sending tool result to JavaScript: ${e.message}", e)
-                }
+            ensureQuickJs()
+            try {
+                val jsCode =
+                    JsNativeInterfaceDelegates.buildToolResultCallbackScript(
+                        callbackId = callbackId,
+                        result = result,
+                        isError = isError
+                    )
+                launchQuickJsEvaluation(
+                    script = jsCode,
+                    onError = { e ->
+                        AppLogger.e(TAG, "Error sending tool result to JavaScript: ${e.message}", e)
+                    }
+                )
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error sending tool result to JavaScript: ${e.message}", e)
             }
         }
 
@@ -1472,13 +1571,7 @@ class JsEngine(private val context: Context) {
         try {
             // 确保任何挂起的回调被完成
             cancelAllExecutionSessions("Engine destroyed")
-
-            toolCallbacks.forEach { (_, future) ->
-                if (!future.isDone) {
-                    future.complete("Engine destroyed")
-                }
-            }
-            toolCallbacks.clear()
+            toolCallInterface.detachJavaBridgeLifecycle()
 
             // 清理Bitmap注册表
             bitmapRegistry.values.forEach { it.recycle() }
@@ -1488,83 +1581,24 @@ class JsEngine(private val context: Context) {
             binaryDataRegistry.clear()
             javaObjectRegistry.clear()
 
-            // 在主线程中销毁 WebView
-            ContextCompat.getMainExecutor(context).execute {
-                try {
-                    webView?.apply {
-                        removeJavascriptInterface("NativeInterface")
-                        loadUrl("about:blank")
-                        clearHistory()
-                        clearCache(true)
-                        destroy()
+            try {
+                val engine = quickJs
+                if (engine != null) {
+                    runOnQuickJsThreadBlocking {
+                        engine.close()
                     }
-                    webView = null
-                } catch (e: Exception) {
-                    AppLogger.e(TAG, "Error destroying WebView: ${e.message}", e)
                 }
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Error closing QuickJS: ${e.message}", e)
             }
+            quickJs = null
+            quickJsThread = null
+            jsEnvironmentInitialized = false
+            quickJsDispatcher.close()
+            quickJsExecutor.shutdownNow()
         } catch (e: Exception) {
             AppLogger.e(TAG, "Error during JsEngine destruction: ${e.message}", e)
         }
     }
 
-    /** 处理引擎异常 */
-    private fun handleException(e: Exception): String {
-        AppLogger.e(TAG, "JsEngine exception: ${e.message}", e)
-
-        // 尝试重置当前状态
-        try {
-            resetState()
-        } catch (resetEx: Exception) {
-            AppLogger.e(TAG, "Failed to reset state after exception: ${resetEx.message}", resetEx)
-        }
-
-        return "Error: ${e.message}"
-    }
-
-    /** 诊断引擎状态 用于调试目的，记录当前状态信息 */
-    fun diagnose() {
-        try {
-            AppLogger.d(TAG, "=== JsEngine Diagnostics ===")
-            AppLogger.d(TAG, "WebView initialized: ${webView != null}")
-            AppLogger.d(TAG, "Active execution sessions: ${activeExecutionSessions.size}")
-            AppLogger.d(TAG, "Tool callbacks pending: ${toolCallbacks.size}")
-
-            // 检查WebView状态
-            if (webView != null) {
-                ContextCompat.getMainExecutor(context).execute {
-                    webView?.evaluateJavascript(
-                            """
-                        (function() {
-                            var result = {
-                                memory: (window.performance && window.performance.memory) 
-                                    ? {
-                                        totalJSHeapSize: window.performance.memory.totalJSHeapSize,
-                                        usedJSHeapSize: window.performance.memory.usedJSHeapSize,
-                                        jsHeapSizeLimit: window.performance.memory.jsHeapSizeLimit
-                                      } 
-                                    : "Not available",
-                                timers: "Unable to count"
-                            };
-                            
-                            // 尝试估计定时器数量
-                            try {
-                                var count = 0;
-                                var id = setTimeout(function(){}, 0);
-                                clearTimeout(id);
-                                result.timers = id;
-                            } catch(e) {}
-                            
-                            return JSON.stringify(result);
-                        })();
-                    """
-                    ) { diagResult -> AppLogger.d(TAG, "WebView diagnostics: $diagResult") }
-                }
-            }
-
-            AppLogger.d(TAG, "=========================")
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error during diagnostics: ${e.message}", e)
-        }
-    }
 }

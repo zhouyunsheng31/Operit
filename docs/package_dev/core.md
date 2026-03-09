@@ -143,10 +143,13 @@ complete<T>(result: T): void
 - `javaSetStaticField(className, fieldName, valueJson)`
 - `javaGetInstanceField(instanceHandle, fieldName)`
 - `javaSetInstanceField(instanceHandle, fieldName, valueJson)`
-- `javaReleaseInstance(instanceHandle)`
-- `javaReleaseAllInstances()`
 
 这些方法普遍返回桥接 JSON 字符串，需要调用方自行解析。
+
+补充说明：
+
+- Java 实例句柄的解绑属于运行时内部生命周期管理，不再提供公开的 `release` / `releaseAll` 脚本接口。
+- `Java.implement(...)` / `Java.proxy(...)` 产生的 JS 回调对象改为运行时自动解绑，旧的脚本侧手动释放接口已移除。
 
 ## 全局工具对象
 

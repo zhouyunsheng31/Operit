@@ -544,19 +544,17 @@ await Tools.UI.swipe(540, 1800, 540, 900);
     -   `Java.proxy(interfaceNameOrNames, impl)`（`implement` 别名）
     -   **语法糖**：当 Java/Kotlin 方法参数为接口类型时，可直接传 JS 函数/对象，桥接会自动推断接口并创建代理（无需显式 `implement`）
 -   生命周期管理：
-    -   `obj.release()` / `Java.release(instanceOrHandle)`
-    -   `Java.releaseAll()`
-    -   `Java.releaseJs(markerOrId)`（释放 `implement/proxy` 注册的 JS 回调对象）
+    -   Java 实例 handle 与 JS 接口回调都由运行时自动管理，无需手动释放脚本侧回调标记
 
-#### 3.4.3. 句柄与释放建议
+#### 3.4.3. 句柄与生命周期建议
 
 Java 复杂对象跨桥接会被包装成“实例代理”（内部是 handle 句柄），建议：
 
--   对短生命周期对象，在 `finally` 中显式 `release`。
--   对 `Java.implement` / `Java.proxy` 产生的回调标记，完成后调用 `Java.releaseJs(...)`。
--   运行时已接入自动回收（代理对象被 GC 后会尝试释放对应句柄），但 GC 时机不确定，**不要只依赖自动回收**。
+-   `Java.implement` / `Java.proxy` 产生的回调标记不再需要手动释放；对应 Java 代理被 GC 后，运行时会自动解除当前 JS 回调注册。
+-   Java 实例代理的 handle 解绑由运行时自动处理；业务脚本不再暴露 `obj.release()` / `Java.release(...)` / `Java.releaseAll()`。
+-   运行时会在代理对象被 GC 后尝试解绑对应 handle，也会在引擎销毁时清理剩余句柄；GC 时机本身仍然是不确定的。
 
-#### 3.4.4. 示例：包链语法 + 回调 + 释放
+#### 3.4.4. 示例：包链语法 + 回调
 
 ```typescript
 const Thread = Java.java.lang.Thread;
@@ -568,14 +566,9 @@ const runnable = Java.implement(Runnable, () => {
 });
 
 const worker = new Thread(runnable);
-try {
-    worker.start();
-    worker.join(2000);
-    console.log("runCount=", runCount);
-} finally {
-    worker.release();
-    Java.releaseJs(runnable);
-}
+worker.start();
+worker.join(2000);
+console.log("runCount=", runCount);
 ```
 
 #### 3.4.5. 示例：Android 类与内部类

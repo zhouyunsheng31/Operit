@@ -77,14 +77,21 @@ class PlanModeManager {
         console.log(`${TAG} cancel called`);
     }
     shouldUseDeepSearchMode(message) {
+        const startTime = Date.now();
         const normalized = String(message || "").trim();
-        if (!normalized)
+        if (!normalized) {
+            console.log(`${TAG} shouldUseDeepSearchMode empty message elapsedMs=${Date.now() - startTime}`);
             return false;
+        }
         const i18n = getI18n();
         const indicators = (i18n.complexityIndicators || [])
             .map(item => String(item || "").trim())
             .filter(Boolean);
-        return indicators.some(ind => normalized.toLowerCase().indexOf(ind.toLowerCase()) >= 0);
+        const normalizedLower = normalized.toLowerCase();
+        const matchedIndicator = indicators.find(ind => normalizedLower.indexOf(ind.toLowerCase()) >= 0) || "";
+        const shouldUse = Boolean(matchedIndicator);
+        console.log(`${TAG} shouldUseDeepSearchMode elapsedMs=${Date.now() - startTime} indicators=${indicators.length} matched=${shouldUse} matchedIndicator=${matchedIndicator || "none"}`);
+        return shouldUse;
     }
     async executeDeepSearchMode(userMessage, chatHistory, workspacePath, maxTokens, tokenUsageThreshold, onChunk) {
         this.isCancelled = false;
@@ -102,17 +109,8 @@ class PlanModeManager {
         try {
             const i18n = getI18n();
             const processingState = newInputProcessingState("Processing", i18n.planModeExecutingDeepSearch);
-            try {
-                this.enhancedAIService
-                    .setInputProcessingState(processingState);
-            }
-            finally {
-                try {
-                    if (processingState)
-                        Java.release(processingState);
-                }
-                catch (_e) { }
-            }
+            this.enhancedAIService
+                .setInputProcessingState(processingState);
             const executionGraph = await this.generateExecutionPlan(userMessage, chatHistory, workspacePath, maxTokens, tokenUsageThreshold);
             if (this.isCancelled) {
                 append(`<log>🟡 ${i18n.planModeTaskCancelled}</log>\n`);
@@ -121,33 +119,15 @@ class PlanModeManager {
             if (!executionGraph) {
                 append(`<error>❌ ${i18n.planModeFailedToGeneratePlan}</error>\n`);
                 const idleState = newInputProcessingState("Idle");
-                try {
-                    this.enhancedAIService
-                        .setInputProcessingState(idleState);
-                }
-                finally {
-                    try {
-                        if (idleState)
-                            Java.release(idleState);
-                    }
-                    catch (_e) { }
-                }
+                this.enhancedAIService
+                    .setInputProcessingState(idleState);
                 return output;
             }
             append(`<plan>\n`);
             append(`<graph><![CDATA[${JSON.stringify(executionGraph)}]]></graph>\n`);
             const executingState = newInputProcessingState("Processing", i18n.planModeExecutingSubtasks);
-            try {
-                this.enhancedAIService
-                    .setInputProcessingState(executingState);
-            }
-            finally {
-                try {
-                    if (executingState)
-                        Java.release(executingState);
-                }
-                catch (_e) { }
-            }
+            this.enhancedAIService
+                .setInputProcessingState(executingState);
             const executionOutput = await this.taskExecutor.executeSubtasks(executionGraph, userMessage, chatHistory, workspacePath, maxTokens, tokenUsageThreshold);
             output += executionOutput;
             if (this.isCancelled) {
@@ -158,31 +138,13 @@ class PlanModeManager {
             append(`<log>🎯 ${i18n.planModeAllTasksCompleted}</log>\n`);
             append(`</plan>\n`);
             const summaryState = newInputProcessingState("Processing", i18n.planModeSummarizingResults);
-            try {
-                this.enhancedAIService
-                    .setInputProcessingState(summaryState);
-            }
-            finally {
-                try {
-                    if (summaryState)
-                        Java.release(summaryState);
-                }
-                catch (_e) { }
-            }
+            this.enhancedAIService
+                .setInputProcessingState(summaryState);
             const summary = await this.taskExecutor.summarize(executionGraph, userMessage, chatHistory, workspacePath, maxTokens, tokenUsageThreshold);
             output += summary;
             const completedState = newInputProcessingState("Completed");
-            try {
-                this.enhancedAIService
-                    .setInputProcessingState(completedState);
-            }
-            finally {
-                try {
-                    if (completedState)
-                        Java.release(completedState);
-                }
-                catch (_e) { }
-            }
+            this.enhancedAIService
+                .setInputProcessingState(completedState);
             return output;
         }
         catch (e) {
@@ -193,17 +155,8 @@ class PlanModeManager {
                 append(`<error>❌ ${getI18n().planModeExecutionFailed}: ${String(e)}</error>\n`);
             }
             const idleState = newInputProcessingState("Idle");
-            try {
-                this.enhancedAIService
-                    .setInputProcessingState(idleState);
-            }
-            finally {
-                try {
-                    if (idleState)
-                        Java.release(idleState);
-                }
-                catch (_e) { }
-            }
+            this.enhancedAIService
+                .setInputProcessingState(idleState);
             return output;
         }
         finally {
@@ -220,20 +173,11 @@ class PlanModeManager {
             const planningRequest = this.buildPlanningRequest(userMessage);
             const planningHistory = [["system", planningRequest]];
             const aiService = await EnhancedAIService.callSuspend("getAIServiceForFunction", this.context, FunctionType.CHAT);
-            try {
-                const planResponseRaw = await sendPlanningMessage(aiService, this.context, getI18n().planGenerateDetailedPlan, planningHistory);
-                const planResponse = removeThinkingContent(String(planResponseRaw !== null && planResponseRaw !== void 0 ? planResponseRaw : "").trim());
-                console.log(`${TAG} plan response`, planResponse);
-                const graph = (0, plan_parser_1.parseExecutionGraph)(planResponse);
-                return graph;
-            }
-            finally {
-                try {
-                    if (aiService)
-                        Java.release(aiService);
-                }
-                catch (_e) { }
-            }
+            const planResponseRaw = await sendPlanningMessage(aiService, this.context, getI18n().planGenerateDetailedPlan, planningHistory);
+            const planResponse = removeThinkingContent(String(planResponseRaw !== null && planResponseRaw !== void 0 ? planResponseRaw : "").trim());
+            console.log(`${TAG} plan response`, planResponse);
+            const graph = (0, plan_parser_1.parseExecutionGraph)(planResponse);
+            return graph;
         }
         catch (e) {
             console.log(`${TAG} generate plan error`, String(e));

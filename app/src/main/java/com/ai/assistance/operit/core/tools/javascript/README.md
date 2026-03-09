@@ -469,6 +469,9 @@ await toolCall('default', 'http_request', { url: 'https://example.com', method: 
 - `Java.newInstance(className, ...args)`
 - `Java.callStatic(className, methodName, ...args)`
 - `Java.callSuspend(className, methodName, ...args)`
+- `Java.loadDex(path, options?)`
+- `Java.loadJar(path, options?)`
+- `Java.listLoadedCodePaths()`
 
 ---
 
@@ -483,8 +486,6 @@ const sb = new StringBuilder();
 sb.append('hello ');
 sb.append('world');
 const text = sb.toString();
-
-Java.release(sb);
 ```
 
 类访问 / 嵌套类访问语法糖：
@@ -582,6 +583,52 @@ const activity = ActivityLifecycleManager.INSTANCE.getCurrentActivity();
 
 对于 Kotlin 类代理上的静态方法调用，运行时还会自动尝试 `Companion` 回退；
 因此很多 `companion object` 方法也可以直接写成 `SomeKotlinClass.someMethod()`。
+
+#### 动态加载 dex / jar
+
+如果脚本需要访问宿主 APK 之外的类，可以先把外部代码挂进 Java bridge 的
+`ClassLoader` 链，再正常使用 `Java.type(...)` / `Java.xxx.yyy`。
+
+加载 `.dex`：
+
+```js
+Java.loadDex('/data/user/0/com.ai.assistance.operit/files/plugins/demo.dex');
+
+const DemoEntry = Java.type('com.example.demo.Entry');
+const message = DemoEntry.callStatic('hello');
+```
+
+加载 `.jar`：
+
+```js
+Java.loadJar('/data/user/0/com.ai.assistance.operit/files/plugins/demo.jar');
+
+const DemoEntry = Java.type('com.example.demo.Entry');
+const instance = new DemoEntry();
+```
+
+如果外部代码还依赖 `.so`，可以额外指定原生库目录：
+
+```js
+Java.loadDex('/data/user/0/com.ai.assistance.operit/files/plugins/demo.dex', {
+  nativeLibraryDir: '/data/user/0/com.ai.assistance.operit/files/plugins/lib'
+});
+```
+
+查看当前会话里已经挂载过哪些外部代码：
+
+```js
+const loaded = Java.listLoadedCodePaths();
+console.log(JSON.stringify(loaded, null, 2));
+```
+
+约束说明：
+
+- `loadDex(...)` 只接受 `.dex` 文件。
+- `loadJar(...)` 只接受 `.jar` 文件，并且 **jar 内必须包含 `classes.dex`**。
+- 传统 JVM `.class` jar 不能直接在 Android 里通过这个桥执行。
+- 调用顺序要先 `loadDex/loadJar`，再 `Java.type(...)` 或包代理访问类。
+- 同一路径重复加载会复用当前会话里已经创建的加载记录，不会重复挂载。
 
 ---
 
@@ -691,33 +738,23 @@ someApi.setListener({
 
 ---
 
-### 5.5 生命周期：一定要记得 release
+### 5.5 句柄生命周期：实例与 JS 回调自动解绑
 
-桥接实例背后对应 native handle。
+桥接实例背后对应 handle。
 
-短生命周期对象推荐显式释放：
+Java 实例代理的 handle 解绑由运行时自动处理：
 
 ```js
 const obj = Java.newInstance('java.lang.StringBuilder');
-try {
-  obj.append('abc');
-  return obj.toString();
-} finally {
-  Java.release(obj);
-}
+obj.append('abc');
+return obj.toString();
 ```
-
-可用 API：
-
-- `Java.release(instanceOrHandle)`
-- `Java.releaseJs(jsImplOrId)`
-- `Java.releaseAll()`
 
 建议：
 
-- 普通临时实例：`try/finally + Java.release(...)`
-- JS 接口对象不再用时：`Java.releaseJs(...)`
-- 不要在业务代码里滥用 `releaseAll()`
+- JS 接口回调标记不再需要手动释放；对应 Java 代理被 GC 后，运行时会自动解除当前 JS 回调注册
+- Java 实例代理不要再写 `obj.release()` / `Java.release(...)` / `Java.releaseAll()`
+- 运行时会在代理对象被 GC 后尝试解绑对应 handle，也会在引擎销毁时统一清理剩余句柄
 
 ---
 
@@ -818,7 +855,6 @@ exports.Screen = function Screen(ctx) {
 - `toolCall?(...)`
 - `getEnv(key)`
 - `setEnv(key, value)`
-- `readResource(key)`
 - `navigate(route, args?)`
 - `showToast(message)`
 - `reportError(error)`
@@ -945,7 +981,7 @@ exports.default = Screen;
 #### 读取资源
 
 ```js
-const path = await ctx.readResource('icon');
+const path = await ToolPkg.readResource('icon');
 ```
 
 宿主返回的通常是一个可读路径或二进制内容。

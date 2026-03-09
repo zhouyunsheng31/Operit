@@ -515,7 +515,6 @@ export interface ComposeDslContext {
   callTool<T = any>(toolName: string, params?: Record<string, unknown>): Promise<T>;
   getEnv(key: string): string | undefined;
   setEnv(key: string, value: string): Promise<void> | void;
-  readResource(key: string): Promise<string | Uint8Array>;
   navigate(route: string, args?: Record<string, unknown>): Promise<void> | void;
   showToast(message: string): Promise<void> | void;
   reportError(error: unknown): Promise<void> | void;

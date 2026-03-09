@@ -1,359 +1,300 @@
 package com.ai.assistance.operit.core.tools.javascript
 
 import android.content.Context
-import com.ai.assistance.operit.util.AppLogger
 import com.ai.assistance.operit.core.tools.StringResultData
 import com.ai.assistance.operit.core.tools.packTool.PackageManager
 import com.ai.assistance.operit.data.model.AITool
 import com.ai.assistance.operit.data.model.ToolResult
-import java.util.concurrent.ConcurrentHashMap
+import com.ai.assistance.operit.util.AppLogger
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 
-/**
- * Manages JavaScript tool execution using JsEngine This class handles the execution of JavaScript
- * code in package tools and coordinates tool calls from JavaScript back to native Android code.
- */
-class JsToolManager
-private constructor(private val context: Context, private val packageManager: PackageManager) {
+class JsToolManager private constructor(
+    private val context: Context,
+    private val packageManager: PackageManager
+) {
+
     companion object {
         private const val TAG = "JsToolManager"
         private const val MAX_CONCURRENT_ENGINES = 4
 
-        @Volatile private var INSTANCE: JsToolManager? = null
+        @Volatile
+        private var instance: JsToolManager? = null
 
         fun getInstance(context: Context, packageManager: PackageManager): JsToolManager {
-            return INSTANCE
-                    ?: synchronized(this) {
-                        INSTANCE
-                                ?: JsToolManager(context.applicationContext, packageManager).also {
-                                    INSTANCE = it
-                                }
-                    }
+            return instance
+                ?: synchronized(this) {
+                    instance
+                        ?: JsToolManager(context.applicationContext, packageManager).also {
+                            instance = it
+                        }
+                }
         }
     }
 
-    private val enginePool = Channel<JsEngine>(capacity = MAX_CONCURRENT_ENGINES)
-    private val allEngines = ConcurrentHashMap.newKeySet<JsEngine>()
+    private val engines = List(MAX_CONCURRENT_ENGINES) { JsEngine(context) }
+    private val enginePool = Channel<JsEngine>(capacity = MAX_CONCURRENT_ENGINES).also { pool ->
+        engines.forEach(pool::trySend)
+    }
 
-    init {
-        repeat(MAX_CONCURRENT_ENGINES) {
-            val engine = JsEngine(context)
-            allEngines.add(engine)
+    private suspend fun <T> withEngine(block: suspend (JsEngine) -> T): T {
+        val engine = enginePool.receive()
+        return try {
+            block(engine)
+        } finally {
             enginePool.trySend(engine)
         }
     }
 
-    private suspend fun acquireEngine(): JsEngine = enginePool.receive()
-
-    private fun acquireEngineBlocking(): JsEngine = runBlocking { acquireEngine() }
-
-    private fun releaseEngine(engine: JsEngine) {
-        enginePool.trySend(engine)
-    }
-
-    /**
-     * Execute a specific JavaScript tool
-     * @param toolName The name of the tool to execute (format: packageName.functionName)
-     * @param params Parameters to pass to the tool function
-     * @return The result of tool execution
-     */
-    fun executeScript(toolName: String, params: Map<String, String>): String {
-        val engine = acquireEngineBlocking()
-        try {
-            // Split the tool name to get package and function names
-            val parts = toolName.split(".")
-            if (parts.size < 2) {
-                return "Invalid tool name format: $toolName. Expected format: packageName.functionName"
-            }
-
-            val packageName = parts[0]
-            val functionName = parts[1]
-
-            // Get the package script
-            val script =
-                    packageManager.getPackageScript(packageName)
-                            ?: return "Package not found: $packageName"
-
-            AppLogger.d(TAG, "Executing function $functionName in package $packageName")
-
-            // Execute the function in the script
-            val stateId = packageManager.getActivePackageStateId(packageName)
-            val injectedParams = params.toMutableMap()
-            if (stateId != null) {
-                injectedParams["__operit_package_state"] = stateId
-            } else {
-                injectedParams.remove("__operit_package_state")
-            }
-            if (params["__operit_package_caller_name"] != null) {
-                injectedParams["__operit_package_caller_name"] = params["__operit_package_caller_name"].toString()
-            } else {
-                injectedParams.remove("__operit_package_caller_name")
-            }
-            if (params["__operit_package_chat_id"] != null) {
-                injectedParams["__operit_package_chat_id"] = params["__operit_package_chat_id"].toString()
-            } else {
-                injectedParams.remove("__operit_package_chat_id")
-            }
-            if (params["__operit_package_caller_card_id"] != null) {
-                injectedParams["__operit_package_caller_card_id"] = params["__operit_package_caller_card_id"].toString()
-            } else {
-                injectedParams.remove("__operit_package_caller_card_id")
-            }
-            val result = engine.executeScriptFunction(script, functionName, injectedParams)
-
-            return result?.toString() ?: "null"
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error executing script: ${e.message}", e)
-            return "Error: ${e.message}"
-        } finally {
-            releaseEngine(engine)
+    private fun <T> withEngineBlocking(block: (JsEngine) -> T): T {
+        return runBlocking {
+            withEngine { engine -> block(engine) }
         }
     }
 
-    /**
-     * Execute a JavaScript script with the given tool parameters
-     * @param script The JavaScript code to execute
-     * @param tool The tool being executed (provides parameters)
-     * @return The result of script execution
-     */
-    fun executeScript(script: String, tool: AITool): Flow<ToolResult> = channelFlow {
-        var engine: JsEngine? = null
-        try {
-            AppLogger.d(TAG, "Executing script for tool: ${tool.name}")
+    private fun parseDotCall(toolName: String): Pair<String, String>? {
+        val separatorIndex = toolName.lastIndexOf('.')
+        if (separatorIndex <= 0 || separatorIndex >= toolName.lastIndex) {
+            return null
+        }
+        return toolName.substring(0, separatorIndex) to toolName.substring(separatorIndex + 1)
+    }
 
-            engine = acquireEngine()
+    private fun parsePackageToolName(toolName: String): Pair<String, String>? {
+        val separatorIndex = toolName.indexOf(':')
+        if (separatorIndex <= 0 || separatorIndex >= toolName.lastIndex) {
+            return null
+        }
+        return toolName.substring(0, separatorIndex) to toolName.substring(separatorIndex + 1)
+    }
 
-            // Extract the function name from the tool name (packageName:toolName)
-            val parts = tool.name.split(":")
-            if (parts.size != 2) {
-                send(
-                        ToolResult(
-                                toolName = tool.name,
-                                success = false,
-                                result = StringResultData(""),
-                                error = "Invalid tool name format. Expected 'packageName:toolName'"
+    private fun buildRuntimeParams(
+        packageName: String,
+        params: Map<String, Any?>
+    ): MutableMap<String, Any?> {
+        val runtimeParams = params.toMutableMap()
+        packageManager.getActivePackageStateId(packageName)?.let {
+            runtimeParams["__operit_package_state"] = it
+        }
+
+        listOf(
+            "__operit_package_caller_name",
+            "__operit_package_chat_id",
+            "__operit_package_caller_card_id"
+        ).forEach { key ->
+            val value = runtimeParams[key]?.toString()?.takeIf { it.isNotBlank() }
+            if (value == null) {
+                runtimeParams.remove(key)
+            } else {
+                runtimeParams[key] = value
+            }
+        }
+
+        runtimeParams["__operit_package_name"] = packageName
+
+        packageManager.resolveToolPkgSubpackageRuntimeInternal(packageName)?.let { runtime ->
+            runtimeParams["__operit_toolpkg_subpackage_id"] = runtime.subpackageId
+            runtimeParams["containerPackageName"] = runtime.containerPackageName
+            runtimeParams["toolPkgId"] = runtime.containerPackageName
+            runtimeParams["__operit_ui_package_name"] = runtime.containerPackageName
+        } ?: run {
+            runtimeParams.remove("__operit_toolpkg_subpackage_id")
+            runtimeParams.remove("containerPackageName")
+            runtimeParams.remove("toolPkgId")
+            runtimeParams.remove("__operit_ui_package_name")
+        }
+
+        return runtimeParams
+    }
+
+    private fun convertToolParameters(
+        tool: AITool,
+        packageName: String,
+        functionName: String
+    ): MutableMap<String, Any?> {
+        val toolDefinition = packageManager.getPackageTools(packageName)
+            ?.tools
+            ?.find { it.name == functionName }
+
+        val converted = buildMap<String, Any?> {
+            tool.parameters.forEach { parameter ->
+                val type = toolDefinition
+                    ?.parameters
+                    ?.find { it.name == parameter.name }
+                    ?.type
+                    ?.lowercase()
+                    ?: "string"
+
+                val value =
+                    try {
+                        when (type) {
+                            "number" -> parameter.value.toDoubleOrNull()
+                                ?: parameter.value.toLongOrNull()
+                                ?: parameter.value
+                            "integer" -> parameter.value.toLongOrNull() ?: parameter.value
+                            "boolean" -> parameter.value.toBooleanStrictOrNull()
+                                ?: parameter.value.equals("1")
+                            else -> parameter.value
+                        }
+                    } catch (e: Exception) {
+                        AppLogger.w(
+                            TAG,
+                            "Parameter conversion failed: tool=${tool.name}, param=${parameter.name}, type=$type, error=${e.message}"
                         )
-                )
-                return@channelFlow
-            }
-
-            val packageName = parts[0]
-            val functionName = parts[1]
-
-            val stateId = packageManager.getActivePackageStateId(packageName)
-
-            // Get tool definition from PackageManager to access parameter types
-            val toolDefinition = packageManager.getPackageTools(packageName)?.tools?.find { it.name == functionName }
-
-            // Convert tool parameters to map for the script, with type conversion
-            val params: Map<String, Any?> = tool.parameters.associate { param ->
-                val paramDefinition = toolDefinition?.parameters?.find { it.name == param.name }
-                // default to string if not found in metadata
-                val paramType = paramDefinition?.type ?: "string"
-
-                val convertedValue: Any? = try {
-                    when (paramType.lowercase()) {
-                        "number" -> param.value.toDoubleOrNull() ?: param.value.toLongOrNull() ?: param.value
-                        "boolean" -> param.value.toBoolean()
-                        "integer" -> param.value.toLongOrNull() ?: param.value
-                        else -> param.value // string and other types
+                        parameter.value
                     }
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "Failed to convert parameter '${param.name}' with value '${param.value}' to type '$paramType'. Using string value. Error: ${e.message}")
-                    param.value // Fallback to string
-                }
-                param.name to convertedValue
+                put(parameter.name, value)
             }
+        }
 
-            val injectedParams = params.toMutableMap()
-            if (stateId != null) {
-                injectedParams["__operit_package_state"] = stateId
-            } else {
-                injectedParams.remove("__operit_package_state")
-            }
-            if (params["__operit_package_caller_name"] != null) {
-                injectedParams["__operit_package_caller_name"] = params["__operit_package_caller_name"].toString()
-            } else {
-                injectedParams.remove("__operit_package_caller_name")
-            }
-            if (params["__operit_package_chat_id"] != null) {
-                injectedParams["__operit_package_chat_id"] = params["__operit_package_chat_id"].toString()
-            } else {
-                injectedParams.remove("__operit_package_chat_id")
-            }
-            if (params["__operit_package_caller_card_id"] != null) {
-                injectedParams["__operit_package_caller_card_id"] = params["__operit_package_caller_card_id"].toString()
-            } else {
-                injectedParams.remove("__operit_package_caller_card_id")
-            }
+        return buildRuntimeParams(packageName, converted)
+    }
 
-            // Execute the script with timeout
+    private fun success(toolName: String, value: Any?): ToolResult {
+        return ToolResult(
+            toolName = toolName,
+            success = true,
+            result = StringResultData(value?.toString() ?: "null")
+        )
+    }
+
+    private fun failure(toolName: String, message: String): ToolResult {
+        return ToolResult(
+            toolName = toolName,
+            success = false,
+            result = StringResultData(""),
+            error = message
+        )
+    }
+
+    fun executeScript(toolName: String, params: Map<String, String>): String {
+        val parsed = parseDotCall(toolName)
+            ?: return "Invalid tool name format: $toolName. Expected format: packageName.functionName"
+        val (packageName, functionName) = parsed
+        val script = packageManager.getPackageScript(packageName)
+            ?: return "Package not found: $packageName"
+
+        return withEngineBlocking { engine ->
+            try {
+                val runtimeParams = buildRuntimeParams(
+                    packageName = packageName,
+                    params = params.mapValues { it.value as Any? }
+                )
+                engine.executeScriptFunction(
+                    script = script,
+                    functionName = functionName,
+                    params = runtimeParams
+                )?.toString() ?: "null"
+            } catch (e: Exception) {
+                AppLogger.e(
+                    TAG,
+                    "Script execution failed: package=$packageName, function=$functionName, error=${e.message}",
+                    e
+                )
+                "Error: ${e.message}"
+            }
+        }
+    }
+
+    fun executeScript(script: String, tool: AITool): Flow<ToolResult> = channelFlow {
+        val parsed = parsePackageToolName(tool.name)
+        if (parsed == null) {
+            send(failure(tool.name, "Invalid tool name format. Expected 'packageName:toolName'"))
+            return@channelFlow
+        }
+
+        val (packageName, functionName) = parsed
+        withEngine { engine ->
+            val runtimeParams = convertToolParameters(tool, packageName, functionName)
             try {
                 withTimeout(JsTimeoutConfig.SCRIPT_TIMEOUT_MS) {
-                    AppLogger.d(TAG, "Starting script execution for function: $functionName")
-
-                    val startTime = System.currentTimeMillis()
-                    val scriptResult =
-                            engine!!.executeScriptFunction(
-                                    script,
-                                    functionName,
-                                    injectedParams,
-                                    onIntermediateResult = { intermediateResult ->
-                                val resultString = intermediateResult?.toString() ?: "null"
-                                AppLogger.d(TAG, "Intermediate JS result: $resultString")
-                                trySend(
-                                        ToolResult(
-                                                toolName = tool.name,
-                                                success = true,
-                                                result = StringResultData(resultString)
-                                        )
-                                )
-                            })
-
-                    val executionTime = System.currentTimeMillis() - startTime
-                    AppLogger.d(
-                            TAG,
-                            "Script execution completed in ${executionTime}ms with result type: ${scriptResult?.javaClass?.name ?: "null"}"
+                    val result = engine.executeScriptFunction(
+                        script = script,
+                        functionName = functionName,
+                        params = runtimeParams,
+                        onIntermediateResult = { value ->
+                            trySend(success(tool.name, value))
+                        }
                     )
 
-                    // Handle different types of results
-                    when {
-                        scriptResult == null -> {
-                            send(
-                                    ToolResult(
-                                            toolName = tool.name,
-                                            success = false,
-                                            result = StringResultData(""),
-                                            error = "Script returned null result"
-                                    )
-                            )
-                        }
-                        scriptResult is String && scriptResult.startsWith("Error:") -> {
-                            val errorMsg = scriptResult.substring("Error:".length).trim()
-                            AppLogger.e(TAG, "Script execution error: $errorMsg")
-                            send(
-                                    ToolResult(
-                                            toolName = tool.name,
-                                            success = false,
-                                            result = StringResultData(""),
-                                            error = errorMsg
-                                    )
-                            )
-                        }
-                        else -> {
-                            val finalResultString = scriptResult.toString()
-                            AppLogger.d(
-                                    TAG,
-                                    "Final script result: ${finalResultString.take(100)}${if (finalResultString.length > 100) "..." else ""}"
-                            )
-                            send(
-                                    ToolResult(
-                                            toolName = tool.name,
-                                            success = true,
-                                            result = StringResultData(finalResultString)
-                                    )
-                            )
-                        }
+                    val normalizedError = result?.toString()
+                        ?.takeIf { it.startsWith("Error:", ignoreCase = true) }
+                        ?.removePrefix("Error:")
+                        ?.trim()
+                    if (normalizedError != null) {
+                        send(failure(tool.name, normalizedError))
+                    } else {
+                        send(success(tool.name, result))
                     }
                 }
             } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-                AppLogger.w(TAG, "Script execution timed out: ${e.message}")
                 send(
-                        ToolResult(
-                                toolName = tool.name,
-                                success = false,
-                                result = StringResultData(""),
-                                error = "Script execution timed out after ${JsTimeoutConfig.SCRIPT_TIMEOUT_MS}ms"
-                        )
+                    failure(
+                        tool.name,
+                        "Script execution timed out after ${JsTimeoutConfig.SCRIPT_TIMEOUT_MS}ms"
+                    )
                 )
             } catch (e: Exception) {
-                // Catch other execution exceptions
-                AppLogger.e(TAG, "Exception during script execution: ${e.message}", e)
-                send(
-                        ToolResult(
-                                toolName = tool.name,
-                                success = false,
-                                result = StringResultData(""),
-                                error = "Script execution failed: ${e.message}"
-                        )
-                )
+                AppLogger.e(TAG, "Script execution failed: tool=${tool.name}, error=${e.message}", e)
+                send(failure(tool.name, "Script execution failed: ${e.message}"))
             }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error executing script for tool ${tool.name}: ${e.message}", e)
-            send(
-                    ToolResult(
-                            toolName = tool.name,
-                            success = false,
-                            result = StringResultData(""),
-                            error = "Script execution error: ${e.message}"
-                    )
-            )
-        } finally {
-            engine?.let { releaseEngine(it) }
         }
     }
 
     fun executeComposeDsl(
-            script: String,
-            packageName: String = "",
-            uiModuleId: String = "",
-            toolPkgId: String = "",
-            state: Map<String, Any?> = emptyMap(),
-            memo: Map<String, Any?> = emptyMap(),
-            moduleSpec: Map<String, Any?> = emptyMap(),
-            envOverrides: Map<String, String> = emptyMap()
+        script: String,
+        packageName: String = "",
+        uiModuleId: String = "",
+        toolPkgId: String = "",
+        state: Map<String, Any?> = emptyMap(),
+        memo: Map<String, Any?> = emptyMap(),
+        moduleSpec: Map<String, Any?> = emptyMap(),
+        envOverrides: Map<String, String> = emptyMap()
     ): String {
-        val engine = acquireEngineBlocking()
-        try {
-            val runtimeOptions = mutableMapOf<String, Any?>()
-            if (packageName.isNotBlank()) {
-                runtimeOptions["packageName"] = packageName
+        val runtimeOptions = mutableMapOf<String, Any?>()
+        if (packageName.isNotBlank()) {
+            runtimeOptions["packageName"] = packageName
+        }
+        if (uiModuleId.isNotBlank()) {
+            runtimeOptions["uiModuleId"] = uiModuleId
+        }
+        if (toolPkgId.isNotBlank()) {
+            runtimeOptions["toolPkgId"] = toolPkgId
+        }
+        if (state.isNotEmpty()) {
+            runtimeOptions["state"] = state
+        }
+        if (memo.isNotEmpty()) {
+            runtimeOptions["memo"] = memo
+        }
+        if (moduleSpec.isNotEmpty()) {
+            runtimeOptions["moduleSpec"] = moduleSpec
+        }
+        if (packageName.isNotBlank()) {
+            packageManager.getActivePackageStateId(packageName)?.let {
+                runtimeOptions["__operit_package_state"] = it
             }
-            if (uiModuleId.isNotBlank()) {
-                runtimeOptions["uiModuleId"] = uiModuleId
-            }
-            if (toolPkgId.isNotBlank()) {
-                runtimeOptions["toolPkgId"] = toolPkgId
-            }
-            if (state.isNotEmpty()) {
-                runtimeOptions["state"] = state
-            }
-            if (memo.isNotEmpty()) {
-                runtimeOptions["memo"] = memo
-            }
-            if (moduleSpec.isNotEmpty()) {
-                runtimeOptions["moduleSpec"] = moduleSpec
-            }
+        }
 
-            if (packageName.isNotBlank()) {
-                val stateId = packageManager.getActivePackageStateId(packageName)
-                if (!stateId.isNullOrBlank()) {
-                    runtimeOptions["__operit_package_state"] = stateId
-                }
+        return withEngineBlocking { engine ->
+            try {
+                engine.executeComposeDslScript(
+                    script = script,
+                    runtimeOptions = runtimeOptions,
+                    envOverrides = envOverrides
+                )?.toString() ?: "null"
+            } catch (e: Exception) {
+                AppLogger.e(TAG, "Compose DSL execution failed: ${e.message}", e)
+                "Error: ${e.message}"
             }
-            val result =
-                    engine.executeComposeDslScript(
-                            script = script,
-                            runtimeOptions = runtimeOptions,
-                            envOverrides = envOverrides
-                    )
-            return result?.toString() ?: "null"
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error executing compose_dsl script: ${e.message}", e)
-            return "Error: ${e.message}"
-        } finally {
-            releaseEngine(engine)
         }
     }
 
-    /** Clean up resources when the manager is no longer needed */
     fun destroy() {
         enginePool.close()
-        allEngines.forEach { it.destroy() }
-        allEngines.clear()
+        engines.forEach(JsEngine::destroy)
     }
 }
