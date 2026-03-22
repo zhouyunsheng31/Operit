@@ -447,4 +447,9 @@
         
     </application>
 
+    <!-- AgentInstrumentation for high privileges UI automation -->
+    <instrumentation
+        android:name=".core.tools.AgentInstrumentation"
+        android:targetPackage="com.ai.assistance.operit" />
+
 </manifest>

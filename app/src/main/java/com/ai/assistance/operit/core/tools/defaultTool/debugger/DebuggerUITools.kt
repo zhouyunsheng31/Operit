@@ -1,32 +1,37 @@
 package com.ai.assistance.operit.core.tools.defaultTool.debugger
 
-import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.BitmapFactory
+import android.graphics.Rect
+import android.os.Build
+import android.view.KeyEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import androidx.test.uiautomator.By
+import androidx.test.uiautomator.Until
 import java.io.File
 import com.ai.assistance.operit.util.AppLogger
 import com.ai.assistance.operit.core.tools.SimplifiedUINode
 import com.ai.assistance.operit.core.tools.StringResultData
 import com.ai.assistance.operit.core.tools.UIActionResultData
 import com.ai.assistance.operit.core.tools.UIPageResultData
+import com.ai.assistance.operit.core.tools.UiAutomatorBridge
 import com.ai.assistance.operit.core.tools.defaultTool.accessbility.AccessibilityUITools
-import com.ai.assistance.operit.core.tools.defaultTool.standard.StandardUITools
 import com.ai.assistance.operit.core.tools.system.AndroidShellExecutor
 import com.ai.assistance.operit.core.tools.system.ShellIdentity
 import com.ai.assistance.operit.data.model.AITool
+import com.ai.assistance.operit.data.model.ToolParameter
 import com.ai.assistance.operit.data.model.ToolResult
-import com.ai.assistance.operit.data.repository.UIHierarchyManager
-import java.io.StringReader
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import org.xmlpull.v1.XmlPullParser
-import org.xmlpull.v1.XmlPullParserFactory
 import com.ai.assistance.operit.util.OperitPaths
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
-/** 调试级别的UI工具，通过Shell命令实现UI操作，继承无障碍版本 */
+/**
+ * 调试级别的UI工具，通过内存中的 UiAutomation / UiDevice（Instrumentation）实现 UI 操作。
+ * 仅在指定 display 参数时回退到 Shell 命令。
+ */
 open class DebuggerUITools(context: Context) : AccessibilityUITools(context) {
 
     companion object {
@@ -39,465 +44,401 @@ open class DebuggerUITools(context: Context) : AccessibilityUITools(context) {
         return AndroidShellExecutor.executeShellCommand(command, uiShellIdentity)
     }
 
-    /** 是否包含 display 相关参数（有的话强制走 ADB，不走无障碍） */
-    private fun hasDisplayParam(tool: AITool): Boolean {
-        return tool.parameters.any { param ->
-            param.name.equals("display", ignoreCase = true)
-        }
-    }
+    private val automation get() = UiAutomatorBridge.uiAutomation
+    private val device get() = UiAutomatorBridge.uiDevice
 
+    /**
+     * 构建坐标类 shell 命令的 display 参数（如 "-d 1 "）。
+     * 仅用于 tap / swipe / longPress 等直接操作坐标的命令；
+     * 基于 selector 的操作请使用 By.displayId()。
+     */
     private fun getDisplayArg(tool: AITool): String {
         val display = tool.parameters.find { it.name.equals("display", ignoreCase = true) }?.value?.trim()
         return if (!display.isNullOrEmpty()) "-d $display " else ""
     }
 
-    /** 使用Shell命令实现点击操作 */
-    override suspend fun tap(tool: AITool): ToolResult {
-        if (!hasDisplayParam(tool) && UIHierarchyManager.isAccessibilityServiceEnabled(context)) {
-            AppLogger.d(TAG, "无障碍服务已启用，使用无障碍点击")
-            return super.tap(tool)
+    /** 确保自动化服务在线，若未就绪则尝试后台重新拉起 */
+    private suspend fun ensureServiceReady(): Boolean {
+        if (UiAutomatorBridge.isReady) return true
+
+        AppLogger.i(TAG, "自动化服务未就绪，正在尝试唤醒...")
+        val pkgName = context.packageName
+        val cmd = "am instrument -w -e class $pkgName.core.tools.AgentInstrumentation $pkgName/.core.tools.AgentInstrumentation"
+        executeUiShellCommand("$cmd &")
+        for (i in 0..10) {
+            if (UiAutomatorBridge.isReady) {
+                AppLogger.i(TAG, "自动化服务唤醒成功")
+                return true
+            }
+            delay(500)
         }
 
-        val x = tool.parameters.find { it.name == "x" }?.value?.toIntOrNull()
-        val y = tool.parameters.find { it.name == "y" }?.value?.toIntOrNull()
+        AppLogger.e(TAG, "自动化服务唤醒超时")
+        return false
+    }
 
-        if (x == null || y == null) {
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error =
-                            "Missing or invalid coordinates. Both 'x' and 'y' must be valid integers."
-            )
-        }
+    private fun errorResult(tool: AITool, msg: String): ToolResult {
+        return ToolResult(tool.name, false, StringResultData(""), msg)
+    }
 
-        // 显示点击反馈（在主线程上执行）
-        withContext(Dispatchers.Main) { operationOverlay.showTap(x, y) }
+    /** 获取当前页面 UI 信息：通过内存直读节点树，辅以 dumpsys 获取顶层 Activity 名称 */
+    override suspend fun getPageInfo(tool: AITool): ToolResult {
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪，无法获取 UI 树")
 
-        // 使用Shell命令执行点击
-        try {
-            AppLogger.d(TAG, "Attempting to tap at coordinates: ($x, $y) via shell command")
-            val command = "input ${getDisplayArg(tool)}tap $x $y"
-            val result = executeUiShellCommand(command)
+        val displayIdStr = tool.parameters.find { it.name.equals("display", ignoreCase = true) }?.value?.trim()
 
-            if (result.success) {
-                AppLogger.d(TAG, "Tap successful at coordinates: ($x, $y)")
-                // 成功后主动隐藏overlay
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result =
-                                UIActionResultData(
-                                        actionType = "tap",
-                                        actionDescription =
-                                                "Successfully tapped at coordinates ($x, $y) via shell command",
-                                        coordinates = Pair(x, y)
-                                ),
-                        error = ""
-                )
+        return try {
+            val windows = automation?.windows
+            val rootNode = if (!displayIdStr.isNullOrEmpty() && Build.VERSION.SDK_INT >= 30) {
+                val dId = displayIdStr.toIntOrNull() ?: 0
+                windows?.find { it.displayId == dId }?.root ?: automation?.rootInActiveWindow
             } else {
-                AppLogger.e(TAG, "Tap failed at coordinates: ($x, $y), error: ${result.stderr}")
-                withContext(Dispatchers.Main) {
-                    operationOverlay.hide() // 隐藏反馈（在主线程上执行）
+                automation?.rootInActiveWindow
+            }
+
+            // 手动回收 AccessibilityWindowInfo 以防泄漏
+            windows?.forEach { it.recycle() }
+
+            if (rootNode == null) {
+                return errorResult(tool, "无法获取活动窗口根节点")
+            }
+
+            val simplifiedLayout = convertNodeToSimplified(rootNode)
+            var currentPackage = rootNode.packageName?.toString() ?: "Unknown"
+
+            // 读取完毕后释放根节点树，避免 OOM
+            rootNode.recycle()
+
+            // 通过 Shell 获取顶层 Activity 名称
+            val focusInfo = getFocusInfo()
+            if (currentPackage == "Unknown" && focusInfo.packageName != null) {
+                currentPackage = focusInfo.packageName!!
+            }
+
+            ToolResult(
+                toolName = tool.name,
+                success = true,
+                result = UIPageResultData(
+                    packageName = currentPackage,
+                    activityName = focusInfo.activityName ?: "Unknown",
+                    uiElements = simplifiedLayout
+                )
+            )
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "获取页面 UI 信息异常", e)
+            errorResult(tool, "获取页面 UI 信息失败: ${e.message}")
+        }
+    }
+
+    private data class FocusInfoShell(var packageName: String? = null, var activityName: String? = null)
+
+    private suspend fun getFocusInfo(): FocusInfoShell {
+        val result = FocusInfoShell()
+        val commands = listOf(
+            "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'",
+            "dumpsys activity top | grep ACTIVITY",
+            "dumpsys activity activities | grep -E 'topResumedActivity|topActivity'"
+        )
+        for (command in commands) {
+            val shellResult = executeUiShellCommand(command)
+            if (shellResult.success && shellResult.stdout.isNotBlank()) {
+                val patterns = listOf(
+                    "mCurrentFocus=.*?\\s+([a-zA-Z0-9_.]+)/([^\\s}]+)".toRegex(),
+                    "mFocusedApp=.*?ActivityRecord\\{.*?\\s+([a-zA-Z0-9_.]+)/\\.?([^\\s}]+)".toRegex(),
+                    "topActivity=ComponentInfo\\{([a-zA-Z0-9_.]+)/\\.?([^}]+)\\}".toRegex()
+                )
+                for (pattern in patterns) {
+                    val match = pattern.find(shellResult.stdout)
+                    if (match != null && match.groupValues.size >= 3) {
+                        result.packageName = match.groupValues[1]
+                        result.activityName = match.groupValues[2]
+                        return result
+                    }
                 }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error =
-                                "Failed to tap at coordinates ($x, $y): ${result.stderr ?: "Unknown error"}"
-                )
             }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error tapping at coordinates ($x, $y)", e)
-            withContext(Dispatchers.Main) {
-                operationOverlay.hide() // 隐藏反馈（在主线程上执行）
-            }
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error tapping at coordinates: ${e.message ?: "Unknown exception"}"
-            )
         }
+        return result
     }
 
-    override suspend fun longPress(tool: AITool): ToolResult {
-        if (!hasDisplayParam(tool) && UIHierarchyManager.isAccessibilityServiceEnabled(context)) {
-            AppLogger.d(TAG, "无障碍服务已启用，使用无障碍长按")
-            return super.longPress(tool)
+    private fun convertNodeToSimplified(node: AccessibilityNodeInfo): SimplifiedUINode {
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        val boundsString = "[${bounds.left},${bounds.top}][${bounds.right},${bounds.bottom}]"
+
+        val children = mutableListOf<SimplifiedUINode>()
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i)
+            if (child != null) {
+                children.add(convertNodeToSimplified(child))
+                child.recycle()
+            }
         }
 
-        val x = tool.parameters.find { it.name == "x" }?.value?.toIntOrNull()
-        val y = tool.parameters.find { it.name == "y" }?.value?.toIntOrNull()
+        return SimplifiedUINode(
+            className = node.className?.toString()?.substringAfterLast('.'),
+            text = node.text?.toString()?.replace("&#10;", "\n"),
+            contentDesc = node.contentDescription?.toString(),
+            resourceId = node.viewIdResourceName,
+            bounds = boundsString,
+            isClickable = node.isClickable,
+            children = children
+        )
+    }
 
-        if (x == null || y == null) {
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Missing or invalid coordinates. Both 'x' and 'y' must be valid integers."
-            )
+    // ─────────────────────────── clickElement ───────────────────────────
+
+    /** 点击指定元素（支持按 resourceId、contentDesc、className 及坐标范围定位，可选模糊匹配；支持通过 display 参数指定屏幕） */
+    override suspend fun clickElement(tool: AITool): ToolResult {
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪")
+
+        val resourceId = tool.parameters.find { it.name == "resourceId" }?.value
+        val className = tool.parameters.find { it.name == "className" }?.value
+        val desc = tool.parameters.find { it.name == "contentDesc" }?.value
+        val boundsStr = tool.parameters.find { it.name == "bounds" }?.value
+        val displayIdStr = tool.parameters.find { it.name.equals("display", ignoreCase = true) }?.value?.trim()
+
+        val partialMatch = tool.parameters.find { it.name == "partialMatch" }?.value?.toBoolean() ?: false
+        val index = tool.parameters.find { it.name == "index" }?.value?.toIntOrNull() ?: 0
+
+        val targetDevice = device ?: return errorResult(tool, "UiDevice 实例未初始化")
+
+        // 优先处理坐标模式
+        if (boundsStr != null) {
+            extractCenterCoordinates(boundsStr)?.let { (x, y) ->
+                return tap(AITool("tap", tool.parameters.filter { it.name != "bounds" } + listOf(ToolParameter("x", x.toString()), ToolParameter("y", y.toString()))))
+            } ?: return errorResult(tool, "bounds 格式无效")
         }
-
-        withContext(Dispatchers.Main) { operationOverlay.showTap(x, y) }
 
         try {
-            AppLogger.d(TAG, "Attempting to long press at coordinates: ($x, $y) via shell command")
-            // Use swipe to simulate long press
-            val command = "input ${getDisplayArg(tool)}swipe $x $y $x $y 800"
-            val result = executeUiShellCommand(command)
-
-            if (result.success) {
-                AppLogger.d(TAG, "Long press successful at coordinates: ($x, $y)")
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result = UIActionResultData(
-                                actionType = "long_press",
-                                actionDescription = "Successfully long pressed at ($x, $y) via shell command",
-                                coordinates = Pair(x, y)
-                        ),
-                        error = ""
-                )
+            var selector = if (partialMatch) {
+                when {
+                    resourceId != null -> By.res(java.util.regex.Pattern.compile(".*${java.util.regex.Pattern.quote(resourceId)}.*"))
+                    desc != null -> By.descContains(desc)
+                    className != null -> By.clazz(java.util.regex.Pattern.compile(".*${java.util.regex.Pattern.quote(className)}.*"))
+                    else -> return errorResult(tool, "缺少定位参数")
+                }
             } else {
-                AppLogger.e(TAG, "Long press failed at coordinates: ($x, $y), error: ${result.stderr}")
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to long press at coordinates ($x, $y): ${result.stderr ?: "Unknown error"}"
-                )
+                when {
+                    resourceId != null -> By.res(resourceId)
+                    desc != null -> By.desc(desc)
+                    className != null -> By.clazz(className)
+                    else -> return errorResult(tool, "缺少定位参数")
+                }
+            }
+
+            // 通过 By.displayId 将查找范围限定到指定屏幕
+            val displayId = displayIdStr?.toIntOrNull()
+            if (displayId != null) {
+                selector = selector.displayId(displayId)
+            }
+
+            // 等待目标元素出现，最多 3 秒
+            targetDevice.wait(Until.hasObject(selector), 3000)
+            val uiObj = targetDevice.findObjects(selector).getOrNull(index)
+
+            if (uiObj != null) {
+                uiObj.click()
+                return ToolResult(tool.name, true, UIActionResultData("click", "成功点击元素 (index: $index)"))
+            } else {
+                return errorResult(tool, "等待 3000ms 后未找到目标元素 (index: $index)")
             }
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error long pressing at coordinates ($x, $y)", e)
-            withContext(Dispatchers.Main) { operationOverlay.hide() }
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error long pressing at coordinates: ${e.message ?: "Unknown exception"}"
-            )
+            return errorResult(tool, "点击操作异常: ${e.message}")
         }
     }
 
-    /** 使用Shell命令实现滑动操作 */
-    override suspend fun swipe(tool: AITool): ToolResult {
-        if (!hasDisplayParam(tool) && UIHierarchyManager.isAccessibilityServiceEnabled(context)) {
-            AppLogger.d(TAG, "无障碍服务已启用，使用无障碍滑动")
-            return super.swipe(tool)
-        }
+    // ─────────────────────────── tap ───────────────────────────
 
+    override suspend fun tap(tool: AITool): ToolResult {
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪")
+        val x = tool.parameters.find { it.name == "x" }?.value?.toIntOrNull()
+        val y = tool.parameters.find { it.name == "y" }?.value?.toIntOrNull()
+        if (x == null || y == null) return errorResult(tool, "Missing or invalid coordinates. Both 'x' and 'y' must be valid integers.")
+
+        withContext(Dispatchers.Main) { operationOverlay.showTap(x, y) }
+        try {
+            val displayArg = getDisplayArg(tool)
+            val success = if (displayArg.isNotEmpty()) {
+                val command = "input ${displayArg}tap $x $y"
+                executeUiShellCommand(command).success
+            } else {
+                device?.click(x, y) ?: false
+            }
+
+            return if (success) {
+                ToolResult(tool.name, true, UIActionResultData("tap", "成功点击($x,$y)", Pair(x, y)))
+            } else {
+                errorResult(tool, "点击坐标 ($x, $y) 执行失败")
+            }
+        } catch (e: Exception) {
+            return errorResult(tool, "tap 操作异常: ${e.message}")
+        } finally {
+            withContext(Dispatchers.Main) { operationOverlay.hide() }
+        }
+    }
+
+    // ─────────────────────────── swipe ───────────────────────────
+
+    override suspend fun swipe(tool: AITool): ToolResult {
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪")
         val startX = tool.parameters.find { it.name == "start_x" }?.value?.toIntOrNull()
         val startY = tool.parameters.find { it.name == "start_y" }?.value?.toIntOrNull()
         val endX = tool.parameters.find { it.name == "end_x" }?.value?.toIntOrNull()
         val endY = tool.parameters.find { it.name == "end_y" }?.value?.toIntOrNull()
-        val duration = tool.parameters.find { it.name == "duration" }?.value?.toIntOrNull() ?: 300
+        val durationMs = tool.parameters.find { it.name == "duration" }?.value?.toIntOrNull() ?: 300
 
         if (startX == null || startY == null || endX == null || endY == null) {
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error =
-                            "Missing or invalid coordinates. 'start_x', 'start_y', 'end_x', and 'end_y' must be valid integers."
-            )
+            return errorResult(tool, "滑动参数不完整，start_x/start_y/end_x/end_y 均为必填项")
         }
 
-        // 显示滑动反馈（在主线程上执行）
         withContext(Dispatchers.Main) { operationOverlay.showSwipe(startX, startY, endX, endY) }
-
         try {
-            AppLogger.d(
-                    TAG,
-                    "Attempting to swipe from ($startX, $startY) to ($endX, $endY) with duration $duration ms via shell command"
-            )
-            val command = "input ${getDisplayArg(tool)}swipe $startX $startY $endX $endY $duration"
-            val result = executeUiShellCommand(command)
-
-            if (result.success) {
-                AppLogger.d(TAG, "Swipe successful from ($startX, $startY) to ($endX, $endY)")
-                // 成功后主动隐藏overlay
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result =
-                                UIActionResultData(
-                                        actionType = "swipe",
-                                        actionDescription =
-                                                "Successfully performed swipe from ($startX, $startY) to ($endX, $endY) via shell command"
-                                ),
-                        error = ""
-                )
+            val displayArg = getDisplayArg(tool)
+            val success = if (displayArg.isNotEmpty()) {
+                val command = "input ${displayArg}swipe $startX $startY $endX $endY $durationMs"
+                executeUiShellCommand(command).success
             } else {
-                AppLogger.e(TAG, "Swipe failed: ${result.stderr}")
-                withContext(Dispatchers.Main) {
-                    operationOverlay.hide() // 隐藏反馈（在主线程上执行）
-                }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to perform swipe: ${result.stderr ?: "Unknown error"}"
-                )
+                // UiDevice 步数估算：约每步 5ms
+                val steps = (durationMs / 5).coerceAtLeast(10)
+                device?.swipe(startX, startY, endX, endY, steps) ?: false
+            }
+
+            return if (success) {
+                ToolResult(tool.name, true, UIActionResultData("swipe", "滑动成功: ($startX,$startY) → ($endX,$endY)"))
+            } else {
+                errorResult(tool, "滑动操作执行失败")
             }
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error performing swipe", e)
-            withContext(Dispatchers.Main) {
-                operationOverlay.hide() // 隐藏反馈（在主线程上执行）
-            }
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error performing swipe: ${e.message ?: "Unknown exception"}"
-            )
+            return errorResult(tool, "滑动操作异常: ${e.message}")
+        } finally {
+            withContext(Dispatchers.Main) { operationOverlay.hide() }
         }
     }
 
-    /** 使用Shell命令点击元素 */
-    override suspend fun clickElement(tool: AITool): ToolResult {
-        if (!hasDisplayParam(tool) && UIHierarchyManager.isAccessibilityServiceEnabled(context)) {
-            AppLogger.d(TAG, "无障碍服务已启用，使用无障碍点击元素")
-            return super.clickElement(tool)
-        }
+    // ─────────────────────────── longPress ───────────────────────────
 
-        val resourceId = tool.parameters.find { it.name == "resourceId" }?.value
-        val className = tool.parameters.find { it.name == "className" }?.value
-        val contentDesc = tool.parameters.find { it.name == "contentDesc" }?.value
-        // index kept for future use
-        tool.parameters.find { it.name == "index" }?.value?.toIntOrNull() ?: 0
-        val bounds = tool.parameters.find { it.name == "bounds" }?.value
+    override suspend fun longPress(tool: AITool): ToolResult {
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪")
+        val x = tool.parameters.find { it.name == "x" }?.value?.toIntOrNull()
+        val y = tool.parameters.find { it.name == "y" }?.value?.toIntOrNull()
+        if (x == null || y == null) return errorResult(tool, "坐标参数缺失，x 和 y 均为必填项")
 
-        if (resourceId == null && className == null && bounds == null && contentDesc == null) {
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error =
-                            "Missing element identifier. Provide at least one of: 'resourceId', 'className', 'contentDesc', or 'bounds'."
-            )
-        }
-
-        // 如果提供了边界坐标，直接点击
-        if (bounds != null) {
-            try {
-                // 解析边界坐标格式 [left,top][right,bottom]
-                val boundsPattern = "\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]".toRegex()
-                val matchResult = boundsPattern.find(bounds)
-
-                if (matchResult == null || matchResult.groupValues.size < 5) {
-                    return ToolResult(
-                            toolName = tool.name,
-                            success = false,
-                            result = StringResultData(""),
-                            error = "Invalid bounds format. Should be: [left,top][right,bottom]"
-                    )
-                }
-
-                // 提取坐标
-                val x1 = matchResult.groupValues[1].toInt()
-                val y1 = matchResult.groupValues[2].toInt()
-                val x2 = matchResult.groupValues[3].toInt()
-                val y2 = matchResult.groupValues[4].toInt()
-
-                // 计算中心点
-                val centerX = (x1 + x2) / 2
-                val centerY = (y1 + y2) / 2
-
-                // 利用tap方法点击中心点
-                val tapTool =
-                        AITool(
-                                name = "tap",
-                                parameters =
-                                        listOf(
-                                                com.ai.assistance.operit.data.model.ToolParameter(
-                                                        "x",
-                                                        centerX.toString()
-                                                ),
-                                                com.ai.assistance.operit.data.model.ToolParameter(
-                                                        "y",
-                                                        centerY.toString()
-                                                )
-                                        )
-                        )
-
-                return tap(tapTool)
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Error processing bounds", e)
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Error processing bounds: ${e.message}"
-                )
+        withContext(Dispatchers.Main) { operationOverlay.showTap(x, y) }
+        try {
+            val displayArg = getDisplayArg(tool)
+            val durationMs = 800
+            val success = if (displayArg.isNotEmpty()) {
+                val command = "input ${displayArg}swipe $x $y $x $y $durationMs"
+                executeUiShellCommand(command).success
+            } else {
+                // 通过原位滑动模拟长按（5ms × 160 步 = 800ms）
+                device?.swipe(x, y, x, y, 160) ?: false
             }
-        }
 
-        // 使用uiautomator获取和点击元素
-        return clickElementWithUiautomator(tool)
+            return if (success) {
+                ToolResult(tool.name, true, UIActionResultData("long_press", "长按操作成功"))
+            } else {
+                errorResult(tool, "长按操作执行失败")
+            }
+        } catch (e: Exception) {
+            return errorResult(tool, "长按操作异常: ${e.message}")
+        } finally {
+            withContext(Dispatchers.Main) { operationOverlay.hide() }
+        }
     }
 
-    /** 使用Shell命令设置输入文本 */
+    // ─────────────────────────── setInputText ───────────────────────────
+
     override suspend fun setInputText(tool: AITool): ToolResult {
-        if (!hasDisplayParam(tool) && UIHierarchyManager.isAccessibilityServiceEnabled(context)) {
-            AppLogger.d(TAG, "无障碍服务已启用，使用无障碍设置文本")
-            return super.setInputText(tool)
-        }
-
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪，无法执行输入")
         val text = tool.parameters.find { it.name == "text" }?.value ?: ""
 
+        val overlay = operationOverlay
         try {
-            // 获取屏幕中心作为文本输入的位置
             val displayMetrics = context.resources.displayMetrics
-            val centerX = displayMetrics.widthPixels / 2
-            val centerY = displayMetrics.heightPixels / 2
-
-            // 显示文本输入反馈（在主线程上执行）
-            withContext(Dispatchers.Main) { operationOverlay.showTextInput(centerX, centerY, text) }
-
-            // 使用KEYCODE_CLEAR清除字段，这比模拟CTRL+A和DEL更直接
-            AppLogger.d(TAG, "Clearing text field with KEYCODE_CLEAR")
-            val clearCommand = "input ${getDisplayArg(tool)}keyevent KEYCODE_CLEAR"
-            executeUiShellCommand(clearCommand)
-
-            // 短暂延迟
-            kotlinx.coroutines.delay(300)
-
-            // 如果文本为空，只需清除字段
-            if (text.isEmpty()) {
-                // 成功后主动隐藏overlay
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result =
-                                UIActionResultData(
-                                        actionType = "textInput",
-                                        actionDescription =
-                                                "Successfully cleared input field via shell command"
-                                ),
-                        error = ""
-                )
+            withContext(Dispatchers.Main) {
+                overlay.showTextInput(displayMetrics.widthPixels / 2, displayMetrics.heightPixels / 2, text)
             }
 
-            // 使用原生复制和ADB粘贴来输入文本，这比'input text'更可靠
-            AppLogger.d(TAG, "Setting text to clipboard and pasting via ADB: $text")
+            device?.pressKeyCode(KeyEvent.KEYCODE_CLEAR)
+            delay(100)
+
+            if (text.isEmpty()) {
+                return ToolResult(tool.name, true, UIActionResultData("textInput", "已清空输入框"))
+            }
+
             withContext(Dispatchers.Main) {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val clip = ClipData.newPlainText("operit_input", text)
-                clipboard.setPrimaryClip(clip)
+                clipboard.setPrimaryClip(ClipData.newPlainText("operit_input", text))
             }
+            delay(100)
 
-            // 短暂延迟以确保剪贴板操作完成
-            kotlinx.coroutines.delay(100)
+            device?.pressKeyCode(KeyEvent.KEYCODE_PASTE)
 
-            // 执行粘贴命令
-            val pasteCommand = "input ${getDisplayArg(tool)}keyevent KEYCODE_PASTE"
-            val pasteResult = executeUiShellCommand(pasteCommand)
-
-            if (pasteResult.success) {
-                // 成功后主动隐藏overlay
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result =
-                                UIActionResultData(
-                                        actionType = "textInput",
-                                        actionDescription =
-                                                "Successfully set input text to: $text via clipboard paste"
-                                ),
-                        error = ""
-                )
-            } else {
-                withContext(Dispatchers.Main) {
-                    operationOverlay.hide() // 隐藏反馈（在主线程上执行）
-                }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to paste text from clipboard: ${pasteResult.stderr ?: "Unknown error"}"
-                )
-            }
+            return ToolResult(tool.name, true, UIActionResultData("textInput", "已通过粘贴方式完成文本输入"))
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error setting input text", e)
-            withContext(Dispatchers.Main) {
-                operationOverlay.hide() // 隐藏反馈（在主线程上执行）
-            }
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error setting input text: ${e.message ?: "Unknown exception"}"
-            )
+            return errorResult(tool, "文本输入操作异常: ${e.message}")
+        } finally {
+            withContext(Dispatchers.Main) { overlay.hide() }
         }
     }
 
-    /** 使用Shell命令实现按键操作 */
+    // ─────────────────────────── pressKey ───────────────────────────
+
     override suspend fun pressKey(tool: AITool): ToolResult {
-        //直接用shell
+        if (!ensureServiceReady()) return errorResult(tool, "自动化服务未就绪")
+        val keyCodeStr = tool.parameters.find { it.name == "key_code" }?.value
+            ?: return errorResult(tool, "参数缺失: key_code 为必填项")
 
-        val keyCode = tool.parameters.find { it.name == "key_code" }?.value
+        try {
+            val parsedCode = keyCodeStr.toIntOrNull() ?: when (keyCodeStr.uppercase().removePrefix("KEYCODE_")) {
+                "HOME" -> KeyEvent.KEYCODE_HOME
+                "BACK" -> KeyEvent.KEYCODE_BACK
+                "DPAD_UP" -> KeyEvent.KEYCODE_DPAD_UP
+                "DPAD_DOWN" -> KeyEvent.KEYCODE_DPAD_DOWN
+                "DPAD_LEFT" -> KeyEvent.KEYCODE_DPAD_LEFT
+                "DPAD_RIGHT" -> KeyEvent.KEYCODE_DPAD_RIGHT
+                "ENTER" -> KeyEvent.KEYCODE_ENTER
+                "DEL" -> KeyEvent.KEYCODE_DEL
+                "CLEAR" -> KeyEvent.KEYCODE_CLEAR
+                "SPACE" -> KeyEvent.KEYCODE_SPACE
+                "TAB" -> KeyEvent.KEYCODE_TAB
+                "ESCAPE" -> KeyEvent.KEYCODE_ESCAPE
+                "POWER" -> KeyEvent.KEYCODE_POWER
+                "VOLUME_UP" -> KeyEvent.KEYCODE_VOLUME_UP
+                "VOLUME_DOWN" -> KeyEvent.KEYCODE_VOLUME_DOWN
+                "VOLUME_MUTE" -> KeyEvent.KEYCODE_VOLUME_MUTE
+                "MENU" -> KeyEvent.KEYCODE_MENU
+                "SEARCH" -> KeyEvent.KEYCODE_SEARCH
+                "APP_SWITCH" -> KeyEvent.KEYCODE_APP_SWITCH
+                else -> null
+            }
 
-        if (keyCode == null) {
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Missing 'key_code' parameter."
-            )
-        }
-
-        val command = "input ${getDisplayArg(tool)}keyevent $keyCode"
-
-        return try {
-            val result = executeUiShellCommand(command)
-
-            if (result.success) {
-                ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result =
-                                UIActionResultData(
-                                        actionType = "keyPress",
-                                        actionDescription =
-                                                "Successfully pressed key: $keyCode via shell command"
-                                ),
-                        error = ""
-                )
+            val success = if (parsedCode != null) {
+                device?.pressKeyCode(parsedCode) ?: false
             } else {
-                ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to press key: ${result.stderr ?: "Unknown error"}"
-                )
+                executeUiShellCommand("input keyevent $keyCodeStr").success
+            }
+
+            return if (success) {
+                ToolResult(tool.name, true, UIActionResultData("keyPress", "按键成功: $keyCodeStr"))
+            } else {
+                errorResult(tool, "按键操作执行失败")
             }
         } catch (e: Exception) {
-            AppLogger.e(TAG, "Error pressing key", e)
-            ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error pressing key: ${e.message ?: "Unknown exception"}"
-            )
+            return errorResult(tool, "按键操作异常: ${e.message}")
         }
     }
+
+    // ─────────────────────────── 截图（保留 shell screencap） ───────────────────────────
 
     override suspend fun captureScreenshotToFile(tool: AITool): Pair<String?, Pair<Int, Int>?> {
         return try {
             val screenshotDir = OperitPaths.cleanOnExitDir()
-
             val shortName = System.currentTimeMillis().toString().takeLast(4)
             val file = File(screenshotDir, "$shortName.png")
 
-            // 1) Debugger 模式下优先尝试 Shell 模式 (ADB) 截图
+            // Debugger 模式下优先尝试 Shell 模式截图
             AppLogger.d(TAG, "captureScreenshotToFile: Attempting shell screencap")
             val command = "screencap -p ${file.absolutePath}"
             val result = executeUiShellCommand(command)
@@ -514,7 +455,7 @@ open class DebuggerUITools(context: Context) : AccessibilityUITools(context) {
                 return Pair(file.absolutePath, dimensions)
             }
 
-            // 2) 如果 Shell 失败，作为回退尝试无障碍截图 (调用父类)
+            // 如果 Shell 失败，回退到无障碍截图
             AppLogger.w(TAG, "captureScreenshotToFile: Shell screencap failed, falling back to accessibility")
             super.captureScreenshotToFile(tool)
         } catch (e: Exception) {
@@ -527,804 +468,19 @@ open class DebuggerUITools(context: Context) : AccessibilityUITools(context) {
         return captureScreenshotToFile(tool)
     }
 
-    /** 使用Shell命令获取页面信息 */
-    override suspend fun getPageInfo(tool: AITool): ToolResult {
-        if (!hasDisplayParam(tool) && UIHierarchyManager.isAccessibilityServiceEnabled(context)) {
-            AppLogger.d(TAG, "无障碍服务已启用，使用无障碍获取页面信息")
-            return super.getPageInfo(tool)
-        }
-
-        val format = tool.parameters.find { it.name == "format" }?.value ?: "xml"
-        // detail kept for future use
-        tool.parameters.find { it.name == "detail" }?.value ?: "summary"
-
-        if (format !in listOf("xml", "json")) {
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Invalid format specified. Must be 'xml' or 'json'."
-            )
-        }
-
-        return try {
-            // 获取UI数据
-            val uiData = getUIDataFromShell(tool)
-            if (uiData == null) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to retrieve UI data."
-                )
-            }
-
-            // 解析当前窗口信息
-            val focusInfo = extractFocusInfoFromShell(uiData.windowInfo)
-
-            // 简化布局信息
-            val simplifiedLayout = simplifyLayoutFromXml(uiData.uiXml)
-
-            // 创建结构化数据
-            val resultData =
-                    UIPageResultData(
-                            packageName = focusInfo.packageName ?: "Unknown",
-                            activityName = focusInfo.activityName ?: "Unknown",
-                            uiElements = simplifiedLayout
-                    )
-
-            ToolResult(toolName = tool.name, success = true, result = resultData, error = "")
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error getting page info", e)
-            ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error getting page info: ${e.message}"
-            )
-        }
-    }
-
-    /** UI数据类，保存XML和窗口信息 */
-    private data class UIData(val uiXml: String, val windowInfo: String)
-
-    /** 获取UI数据，使用Shell命令，严格遵守工具参数中的 display（如有） */
-    private suspend fun getUIDataFromShell(tool: AITool): UIData? {
-        return try {
-            // 使用ADB命令获取UI dump
-            AppLogger.d(TAG, "使用ADB命令获取UI数据")
-
-            val displayId = tool.parameters
-                .find { it.name.equals("display", ignoreCase = true) }
-                ?.value
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-
-            // 执行UI dump命令，只有在显式提供 display 参数时才使用 --display-id
-            var dumpResult = if (displayId != null) {
-                val cmd = "uiautomator dump --display-id $displayId /sdcard/window_dump.xml"
-                AppLogger.d(TAG, "UI dump using explicit display-id=$displayId")
-                executeUiShellCommand(cmd)
-            } else {
-                executeUiShellCommand("uiautomator dump /sdcard/window_dump.xml")
-            }
-
-            if (!dumpResult.success && displayId != null) {
-                AppLogger.w(TAG, "uiautomator dump with explicit display-id failed, falling back: ${dumpResult.stderr}")
-                dumpResult = executeUiShellCommand("uiautomator dump /sdcard/window_dump.xml")
-            }
-
-            if (!dumpResult.success) {
-                AppLogger.e(TAG, "uiautomator dump失败: ${dumpResult.stderr}")
-                return null
-            }
-            AppLogger.d(TAG, "uiautomator dump成功: ${dumpResult.stdout}")
-
-            // 读取dump文件内容
-            val readResult = executeUiShellCommand("cat /sdcard/window_dump.xml")
-            if (!readResult.success) {
-                AppLogger.e(TAG, "读取UI dump文件失败: ${readResult.stderr}")
-                return null
-            }
-
-            // 获取窗口信息
-            var windowInfo = getWindowInfoFromShell()
-
-            // 如果窗口信息为空，尝试延迟后重试一次
-            if (windowInfo.isEmpty()) {
-                AppLogger.w(TAG, "首次获取窗口信息失败，延迟500ms后重试")
-                kotlinx.coroutines.delay(500)
-                windowInfo = getWindowInfoFromShell()
-            }
-
-            UIData(readResult.stdout, windowInfo)
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "获取UI数据时出错", e)
-            null
-        }
-    }
-
-    /** 获取窗口信息，使用多种命令尝试 */
-    private suspend fun getWindowInfoFromShell(): String {
-        // 尝试多种命令来获取窗口信息
-        val commands =
-                listOf(
-                        // 标准命令，获取当前焦点和焦点应用
-                        "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'",
-                        // 备用命令，只获取当前焦点
-                        "dumpsys window | grep -E 'mCurrentFocus'",
-                        // 备用命令，只获取焦点应用
-                        "dumpsys window | grep -E 'mFocusedApp'",
-                        // 最后的备用命令，尝试获取任何窗口信息
-                        "dumpsys window | grep -E 'Window #|Focus'",
-                        // 极端情况下，尝试获取前台应用包名
-                        "dumpsys activity recents | grep 'Recent #0' -A2"
-                )
-
-        // 依次尝试每个命令，直到有一个成功
-        for (command in commands) {
-            try {
-                val result = executeUiShellCommand(command)
-                if (result.success && result.stdout.isNotEmpty()) {
-                    AppLogger.d(TAG, "成功获取窗口信息: ${result.stdout.take(100)}")
-                    return result.stdout
-                }
-                // 如果命令执行失败或返回空结果，尝试下一个命令
-                AppLogger.w(TAG, "窗口信息命令 '$command' 失败或返回空结果")
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "执行窗口信息命令 '$command' 出错", e)
-                // 继续尝试下一个命令
-            }
-        }
-
-        // 所有命令都失败时，尝试获取topActivity作为最后的手段
-        try {
-            val topActivityCommand =
-                    "dumpsys activity activities | grep -E 'topResumedActivity|topActivity'"
-            val result = executeUiShellCommand(topActivityCommand)
-            if (result.success && result.stdout.isNotEmpty()) {
-                AppLogger.d(TAG, "使用topActivity作为窗口信息替代: ${result.stdout.take(100)}")
-                return result.stdout
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "获取topActivity失败", e)
-        }
-
-        AppLogger.e(TAG, "所有获取窗口信息的尝试均失败")
-        return ""
-    }
-
-    /** UI节点数据类，仅在Shell实现中使用 */
-    private data class UINodeShell(
-            val className: String?,
-            val text: String?,
-            val contentDesc: String?,
-            val resourceId: String?,
-            val bounds: String?,
-            val isClickable: Boolean,
-            val children: MutableList<UINodeShell> = mutableListOf()
-    )
-
-    /** 简化布局，从XML中提取UI元素，Shell版本 */
-    private fun simplifyLayoutFromXml(xml: String): SimplifiedUINode {
-        val factory = XmlPullParserFactory.newInstance().apply { isNamespaceAware = false }
-        val parser = factory.newPullParser().apply { setInput(StringReader(xml)) }
-
-        val nodeStack = mutableListOf<UINodeShell>()
-        var rootNode: UINodeShell? = null
-
-        while (parser.eventType != XmlPullParser.END_DOCUMENT) {
-            when (parser.eventType) {
-                XmlPullParser.START_TAG -> {
-                    if (parser.name == "node") {
-                        val newNode = createNodeShell(parser)
-                        if (rootNode == null) {
-                            rootNode = newNode
-                            nodeStack.add(newNode)
-                        } else {
-                            nodeStack.lastOrNull()?.children?.add(newNode)
-                            nodeStack.add(newNode)
-                        }
-                    }
-                }
-                XmlPullParser.END_TAG -> {
-                    if (parser.name == "node") {
-                        nodeStack.removeLastOrNull()
-                    }
-                }
-            }
-            parser.next()
-        }
-
-        // 创建默认根节点，如果解析失败
-        return rootNode?.toUINodeSimplified()
-                ?: SimplifiedUINode(
-                        className = null,
-                        text = null,
-                        contentDesc = null,
-                        resourceId = null,
-                        bounds = null,
-                        isClickable = false,
-                        children = emptyList()
-                )
-    }
-
-    // 转换内部UINodeShell为SimplifiedUINode
-    private fun UINodeShell.toUINodeSimplified(): SimplifiedUINode {
-        return SimplifiedUINode(
-                className = className,
-                text = text,
-                contentDesc = contentDesc,
-                resourceId = resourceId,
-                bounds = bounds,
-                isClickable = isClickable,
-                children = children.map { it.toUINodeSimplified() }
-        )
-    }
-
-    private fun createNodeShell(parser: XmlPullParser): UINodeShell {
-        // 解析关键属性
-        val className = parser.getAttributeValue(null, "class")?.substringAfterLast('.')
-        val text = parser.getAttributeValue(null, "text")?.replace("&#10;", "\n")
-        val contentDesc = parser.getAttributeValue(null, "content-desc")
-        val resourceId = parser.getAttributeValue(null, "resource-id")
-        val bounds = parser.getAttributeValue(null, "bounds")
-        val isClickable = parser.getAttributeValue(null, "clickable") == "true"
-
-        return UINodeShell(
-                className = className,
-                text = text,
-                contentDesc = contentDesc,
-                resourceId = resourceId,
-                bounds = bounds,
-                isClickable = isClickable
-        )
-    }
-
-    /** 窗口焦点信息数据类 */
-    private data class FocusInfoShell(
-            var packageName: String? = null,
-            var activityName: String? = null
-    )
-
-    /** 从窗口焦点数据中提取包名和活动名 */
-    private fun extractFocusInfoFromShell(windowInfo: String): FocusInfoShell {
-        val result = FocusInfoShell()
-
-        try {
-            if (windowInfo.isBlank()) {
-                AppLogger.w(TAG, "Window info is empty, cannot extract focus information")
-                // 即使窗口信息为空，也设置默认值，确保不会返回Unknown
-                result.packageName = "android"
-                result.activityName = "ForegroundActivity"
-                return result
-            }
-
-            AppLogger.d(TAG, "Window info for extraction: ${windowInfo.take(200)}")
-
-            // 尝试不同的提取方法，按照特异性顺序
-            if (!extractFromCurrentFocusShell(windowInfo, result) &&
-                            !extractFromFocusedAppShell(windowInfo, result) &&
-                            !extractFromLauncherInfoShell(windowInfo, result) &&
-                            !extractFromTopActivityShell(windowInfo, result) &&
-                            !extractUsingGenericPatternsShell(windowInfo, result)
-            ) {
-
-                AppLogger.w(TAG, "Could not extract focus information using any method")
-            }
-
-            // 最后的回退：如果我们仍然无法确定任何信息，使用默认值
-            if (result.packageName == null) {
-                if (windowInfo.contains("statusbar") || windowInfo.contains("SystemUI")) {
-                    result.packageName = "com.android.systemui"
-                    result.activityName = "SystemUI"
-                    AppLogger.d(TAG, "Using SystemUI fallback")
-                } else if (windowInfo.contains("recents")) {
-                    result.packageName = "com.android.systemui"
-                    result.activityName = "Recents"
-                    AppLogger.d(TAG, "Using Recents fallback")
-                } else {
-                    result.packageName = "android"
-                    result.activityName = "ForegroundActivity"
-                    AppLogger.d(TAG, "Using last-resort fallback values")
-                }
-            }
-
-            // 记录提取结果
-            AppLogger.d(
-                    TAG,
-                    "Final extraction result - package: ${result.packageName}, activity: ${result.activityName}"
-            )
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error parsing window info", e)
-            // 确保即使出现异常，我们也有至少一些默认值
-            if (result.packageName == null) result.packageName = "android"
-            if (result.activityName == null) result.activityName = "ForegroundActivity"
-        }
-
-        return result
-    }
-
-    /**
-     * 从mCurrentFocus格式提取 例如：mCurrentFocus=Window{1234567 u0
-     * com.example.app/com.example.app.MainActivity}
-     */
-    private fun extractFromCurrentFocusShell(windowInfo: String, result: FocusInfoShell): Boolean {
-        // 尝试多种mCurrentFocus格式模式
-        val currentFocusPatterns =
-                listOf(
-                        // 标准格式，具有包/活动（同时也支持 mFocusedWindow）
-                        "(?:mCurrentFocus|mFocusedWindow)=.*?\\{.*?\\s+([a-zA-Z0-9_.]+)/([^\\s}]+)".toRegex(),
-                        // 有时会看到的替代格式
-                        "(?:mCurrentFocus|mFocusedWindow)=.*?\\s+([a-zA-Z0-9_.]+)/([^\\s}]+)\\}".toRegex(),
-                        // 只有包名的格式（活动将单独处理）
-                        "(?:mCurrentFocus|mFocusedWindow)=.*?\\{.*?\\s+([a-zA-Z0-9_.]+)(?:/|\\s)".toRegex()
-                )
-
-        for (pattern in currentFocusPatterns) {
-            val match = pattern.find(windowInfo)
-            if (match != null) {
-                if (match.groupValues.size >= 3) {
-                    // 包含包和活动的模式
-                    result.packageName = match.groupValues[1]
-                    result.activityName = match.groupValues[2]
-                    AppLogger.d(TAG, "Extracted from mCurrentFocus pattern (full): ${pattern.pattern}")
-                    return true
-                } else if (match.groupValues.size >= 2) {
-                    // 只有包名的模式
-                    result.packageName = match.groupValues[1]
-                    AppLogger.d(TAG, "Extracted package from mCurrentFocus pattern: ${pattern.pattern}")
-                    // 返回false以允许其他方法提取活动名称
-                    return false
-                }
-            }
-        }
-        return false
-    }
-
-    /**
-     * 从mFocusedApp格式提取 例如：mFocusedApp=AppWindowToken{token=Token{12345 ActivityRecord{67890 u0
-     * com.example.app/.MainActivity t123}}}
-     */
-    private fun extractFromFocusedAppShell(windowInfo: String, result: FocusInfoShell): Boolean {
-        // mFocusedApp格式的多种模式
-        val focusedAppPatterns =
-                listOf(
-                        // 带有ActivityRecord的标准格式
-                        "mFocusedApp=.*?ActivityRecord\\{.*?\\s+([a-zA-Z0-9_.]+)/\\.?([^\\s}]+)".toRegex(),
-                        // 处理类似于 mFocusedApp=null 后的真实输出行
-                        "ActivityRecord\\{.*?\\s+([a-zA-Z0-9_.]+)/\\.?([^\\s}]+)".toRegex(),
-                        // 有时会看到的替代格式
-                        "mFocusedApp=.*?\\s+([a-zA-Z0-9_.]+)/\\.?([^\\s}]+)\\s".toRegex(),
-                        // 只有包名的格式
-                        "mFocusedApp=.*?\\s+([a-zA-Z0-9_.]+)(?:/|\\s)".toRegex()
-                )
-
-        for (pattern in focusedAppPatterns) {
-            val match = pattern.find(windowInfo)
-            if (match != null) {
-                if (match.groupValues.size >= 3) {
-                    // 包含包和活动的完全匹配
-                    result.packageName = match.groupValues[1]
-                    result.activityName = match.groupValues[2]
-                    AppLogger.d(TAG, "Extracted from mFocusedApp pattern (full): ${pattern.pattern}")
-                    return true
-                } else if (match.groupValues.size >= 2) {
-                    // 只有包的部分匹配
-                    result.packageName = match.groupValues[1]
-                    AppLogger.d(TAG, "Extracted package from mFocusedApp pattern: ${pattern.pattern}")
-                    // 返回false以允许通过其他方法提取活动名称
-                    return false
-                }
-            }
-        }
-        return false
-    }
-
-    /** 为启动器窗口提取信息 例如：mCurrentFocus=Window{1a23bc4 u0 Launcher} */
-    private fun extractFromLauncherInfoShell(windowInfo: String, result: FocusInfoShell): Boolean {
-        // 查找启动器特定模式
-        if (windowInfo.contains("mCurrentFocus") && windowInfo.contains("Launcher")) {
-            val launcherPatterns =
-                    listOf(
-                            "\\{.*?\\s+([a-zA-Z0-9_.]+\\.launcher)/".toRegex(),
-                            "\\{.*?\\s+([a-zA-Z0-9_.]+\\.home)/".toRegex(),
-                            "\\{.*?\\s+Launcher\\}".toRegex()
-                    )
-
-            for (pattern in launcherPatterns) {
-                val match = pattern.find(windowInfo)
-                if (match != null && match.groupValues.size >= 2) {
-                    result.packageName = match.groupValues[1]
-                    result.activityName = "Launcher"
-                    AppLogger.d(TAG, "Extracted launcher info")
-                    return true
-                }
-            }
-
-            // 如果我们检测到Launcher但无法提取特定的包，
-            // 使用默认的启动器包和名称
-            result.packageName = "com.android.launcher3"
-            result.activityName = "Launcher"
-            AppLogger.d(TAG, "Using default launcher info")
-            return true
-        }
-        return false
-    }
-
-    /**
-     * 从topActivity/topResumedActivity输出格式提取
-     * 例如：topActivity=ComponentInfo{com.example.app/.MainActivity}
-     */
-    private fun extractFromTopActivityShell(windowInfo: String, result: FocusInfoShell): Boolean {
-        // topActivity格式的模式
-        val topActivityPatterns =
-                listOf(
-                        "topActivity=ComponentInfo\\{([a-zA-Z0-9_.]+)/\\.?([^}]+)\\}".toRegex(),
-                        "topResumedActivity=ComponentInfo\\{([a-zA-Z0-9_.]+)/\\.?([^}]+)\\}".toRegex(),
-                        "ResumedActivity:\\s+\\{([a-zA-Z0-9_.]+)/\\.?([^\\s}]+)".toRegex()
-                )
-
-        for (pattern in topActivityPatterns) {
-            val match = pattern.find(windowInfo)
-            if (match != null && match.groupValues.size >= 3) {
-                result.packageName = match.groupValues[1]
-                result.activityName = match.groupValues[2]
-                AppLogger.d(TAG, "Extracted from topActivity pattern: ${pattern.pattern}")
-                return true
-            }
-        }
-
-        // 还要查找Recent tasks格式
-        val recentPattern = "Recent #0.*?\\{([a-zA-Z0-9_.]+)/\\.?([^\\s}]+)".toRegex()
-        val recentMatch = recentPattern.find(windowInfo)
-        if (recentMatch != null && recentMatch.groupValues.size >= 3) {
-            result.packageName = recentMatch.groupValues[1]
-            result.activityName = recentMatch.groupValues[2]
-            AppLogger.d(TAG, "Extracted from Recent tasks pattern")
-            return true
-        }
-
-        return false
-    }
-
-    /** 作为后备使用更通用的模式提取 */
-    private fun extractUsingGenericPatternsShell(
-            windowInfo: String,
-            result: FocusInfoShell
-    ): Boolean {
-        var foundAny = false
-
-        // 尝试用各种模式提取包名
-        if (result.packageName == null) {
-            // 查找常见的包模式，如com.android.something
-            val packagePatterns =
-                    listOf(
-                            "\\s([a-zA-Z][a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+){2,})/".toRegex(), // com.example.app/
-                            "\\s([a-zA-Z][a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+){2,})\\s".toRegex(), // com.example.app (空格后)
-                            "([a-zA-Z][a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+){2,})".toRegex() // 只查找任何包名类似的名称
-                    )
-
-            for (pattern in packagePatterns) {
-                val match = pattern.find(windowInfo)
-                if (match != null && match.groupValues.size >= 2) {
-                    val potentialPackage = match.groupValues[1]
-                    // 验证这看起来像一个真实的包（避免匹配随机字符串）
-                    if (potentialPackage.split(".").size >= 3 &&
-                                    !potentialPackage.contains("@") &&
-                                    !potentialPackage.startsWith("1") &&
-                                    !potentialPackage.startsWith("0")
-                    ) {
-
-                        result.packageName = potentialPackage
-                        foundAny = true
-                        AppLogger.d(TAG, "Found package name using fallback pattern: ${pattern.pattern}")
-                        break
-                    }
-                }
-            }
-        }
-
-        // 如果我们还没有活动名称，尝试提取它
-        if (result.activityName == null) {
-            // 查找活动名称模式
-            val activityPatterns =
-                    listOf(
-                            "/\\.?([A-Z][a-zA-Z0-9_]+Activity)".toRegex(), // /.MainActivity or
-                            // /MainActivity
-                            "/([^\\s/}]+)".toRegex(), // 斜杠后的任何段
-                            "\\.([A-Z][a-zA-Z0-9_]+)".toRegex() // .MainActivity
-                    )
-
-            for (pattern in activityPatterns) {
-                val match = pattern.find(windowInfo)
-                if (match != null && match.groupValues.size >= 2) {
-                    val activityName = match.groupValues[1]
-                    // 验证它看起来像一个活动名称（以大写字母开头）
-                    if (activityName.isNotEmpty() &&
-                                    activityName[0].isUpperCase() &&
-                                    !activityName.contains("@")
-                    ) {
-
-                        result.activityName = activityName
-                        foundAny = true
-                        AppLogger.d(TAG, "Found activity name using fallback pattern: ${pattern.pattern}")
-                        break
-                    }
-                }
-            }
-        }
-
-        // 特殊情况处理：如果我们有包名但没有活动名称
-        if (result.packageName != null && result.activityName == null) {
-            // 尝试根据包猜测主活动名称
-            val packageParts = result.packageName!!.split(".")
-            if (packageParts.isNotEmpty()) {
-                val lastPart = packageParts.last().replaceFirstChar { if (it.isLowerCase()) it.titlecase(java.util.Locale.getDefault()) else it.toString() }
-                result.activityName = "${lastPart}Activity"
-                AppLogger.d(TAG, "Guessed activity name from package: ${result.activityName}")
-                foundAny = true
-            }
-        }
-
-        // 如果我们找到了包或活动，将其视为部分成功
-        return foundAny
-    }
-
-
-
-    /** 使用uiautomator点击元素 */
-    private suspend fun clickElementWithUiautomator(tool: AITool): ToolResult {
-        AppLogger.d(TAG, "Using uiautomator to click element")
-
-        val resourceId = tool.parameters.find { it.name == "resourceId" }?.value
-        val className = tool.parameters.find { it.name == "className" }?.value
-        val contentDesc = tool.parameters.find { it.name == "contentDesc" }?.value
-        val index = tool.parameters.find { it.name == "index" }?.value?.toIntOrNull() ?: 0
-        val partialMatch =
-                tool.parameters.find { it.name == "partialMatch" }?.value?.toBoolean() ?: false
-
-        try {
-            // 先尝试获取UI dump
-            AppLogger.d(TAG, "Dumping UI hierarchy to find element")
-            val dumpCommand = "uiautomator dump /sdcard/window_dump.xml"
-            val result = executeUiShellCommand(dumpCommand)
-
-            if (!result.success) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to dump UI hierarchy: ${result.stderr ?: "Unknown error"}"
-                )
-            }
-
-            // 读取dump文件
-            val readCommand = "cat /sdcard/window_dump.xml"
-            val readResult = executeUiShellCommand(readCommand)
-
-            if (!readResult.success) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to read UI dump: ${readResult.stderr ?: "Unknown error"}"
-                )
-            }
-
-            val xml = readResult.stdout
-
-            // 使用XML Parser查找匹配的元素（取代有问题的正则方式）
-            val hasSelectors = resourceId != null || className != null || contentDesc != null
-            if (!hasSelectors) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "No element selector provided."
-                )
-            }
-
-            // 用XmlPullParser逐节点匹配，避免正则跨节点匹配的问题
-            data class MatchedNode(val bounds: String?)
-            val matchingNodes = mutableListOf<MatchedNode>()
-
-            try {
-                val factory = XmlPullParserFactory.newInstance().apply { isNamespaceAware = false }
-                val parser = factory.newPullParser().apply { setInput(StringReader(xml)) }
-
-                while (parser.eventType != XmlPullParser.END_DOCUMENT) {
-                    if (parser.eventType == XmlPullParser.START_TAG && parser.name == "node") {
-                        val actualId = parser.getAttributeValue(null, "resource-id")
-                        val actualClass = parser.getAttributeValue(null, "class")
-                        val actualDesc = parser.getAttributeValue(null, "content-desc")
-                        val actualBounds = parser.getAttributeValue(null, "bounds")
-
-                        var matches = true
-
-                        if (resourceId != null) {
-                            if (actualId == null) {
-                                matches = false
-                            } else if (partialMatch) {
-                                matches = actualId.contains(resourceId)
-                            } else {
-                                // 支持短ID (expand_search) 和完整ID (tv.danmaku.bili:id/expand_search)
-                                matches = actualId == resourceId || actualId.endsWith(":id/$resourceId")
-                            }
-                        }
-
-                        if (matches && className != null) {
-                            if (actualClass == null) {
-                                matches = false
-                            } else if (partialMatch) {
-                                matches = actualClass.contains(className)
-                            } else {
-                                // 支持短类名 (ImageView) 和完整类名 (android.widget.ImageView)
-                                matches = actualClass == className || actualClass.endsWith(".$className")
-                            }
-                        }
-
-                        if (matches && contentDesc != null) {
-                            if (actualDesc == null) {
-                                matches = false
-                            } else if (partialMatch) {
-                                matches = actualDesc.contains(contentDesc, ignoreCase = true)
-                            } else {
-                                matches = actualDesc.equals(contentDesc, ignoreCase = true)
-                            }
-                        }
-
-                        if (matches) {
-                            matchingNodes.add(MatchedNode(bounds = actualBounds))
-                        }
-                    }
-                    parser.next()
-                }
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "Error parsing UI XML", e)
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to parse UI hierarchy XML: ${e.message}"
-                )
-            }
-
-            if (matchingNodes.isEmpty()) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "No matching element found."
-                )
-            }
-
-            if (index < 0 || index >= matchingNodes.size) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error =
-                                "Index out of range. Found ${matchingNodes.size} elements, but requested index $index."
-                )
-            }
-
-            // 获取指定索引的节点bounds
-            val nodeBounds = matchingNodes[index].bounds
-            if (nodeBounds == null) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Target element has no bounds."
-                )
-            }
-
-            // 提取边界坐标
-            val boundsPattern = "\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]".toRegex()
-            val boundsMatch = boundsPattern.find(nodeBounds)
-            if (boundsMatch == null || boundsMatch.groupValues.size < 5) {
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to extract bounds from the element: $nodeBounds"
-                )
-            }
-
-            // 提取坐标
-            val x1 = boundsMatch.groupValues[1].toInt()
-            val y1 = boundsMatch.groupValues[2].toInt()
-            val x2 = boundsMatch.groupValues[3].toInt()
-            val y2 = boundsMatch.groupValues[4].toInt()
-
-            // 计算中心点
-            val centerX = (x1 + x2) / 2
-            val centerY = (y1 + y2) / 2
-
-            // 执行点击（在主线程上显示反馈）
-            withContext(Dispatchers.Main) { operationOverlay.showTap(centerX, centerY) }
-
-            val tapCommand = "input tap $centerX $centerY"
-            val tapResult = executeUiShellCommand(tapCommand)
-
-            if (tapResult.success) {
-                val identifierDescription =
-                        when {
-                            resourceId != null -> " with resource ID: $resourceId"
-                            contentDesc != null -> " with content description: $contentDesc"
-                            else -> " with class name: $className"
-                        }
-
-                val matchCount =
-                        if (matchingNodes.size > 1) {
-                            " (index $index of ${matchingNodes.size} matches)"
-                        } else ""
-
-                // 成功后主动隐藏overlay
-                withContext(Dispatchers.Main) { operationOverlay.hide() }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = true,
-                        result =
-                                UIActionResultData(
-                                        actionType = "click",
-                                        actionDescription =
-                                                "Successfully clicked element$identifierDescription$matchCount at coordinates ($centerX, $centerY) via shell command",
-                                        coordinates = Pair(centerX, centerY),
-                                        elementId = resourceId ?: className ?: contentDesc
-                                ),
-                        error = ""
-                )
-            } else {
-                withContext(Dispatchers.Main) {
-                    operationOverlay.hide()
-                }
-                return ToolResult(
-                        toolName = tool.name,
-                        success = false,
-                        result = StringResultData(""),
-                        error = "Failed to click element: ${tapResult.stderr ?: "Unknown error"}"
-                )
-            }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "Error clicking element with uiautomator", e)
-            withContext(Dispatchers.Main) {
-                operationOverlay.hide()
-            }
-            return ToolResult(
-                    toolName = tool.name,
-                    success = false,
-                    result = StringResultData(""),
-                    error = "Error clicking element: ${e.message ?: "Unknown exception"}"
-            )
-        } finally {
-            // 清理临时文件
-            try {
-                Runtime.getRuntime().exec("rm /sdcard/window_dump.xml")
-            } catch (cleanupEx: Exception) {
-                AppLogger.e(TAG, "Error cleaning up temp file", cleanupEx)
-            }
-        }
-    }
+    // ─────────────────────────── 工具方法 ───────────────────────────
 
     /** 从边界字符串提取中心坐标 返回中心点坐标，或null如果格式无效 */
     protected fun extractCenterCoordinates(bounds: String): Pair<Int, Int>? {
         val boundsPattern = "\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]".toRegex()
         val matchResult = boundsPattern.find(bounds) ?: return null
-
         if (matchResult.groupValues.size < 5) return null
 
-        // 提取坐标
         val x1 = matchResult.groupValues[1].toInt()
         val y1 = matchResult.groupValues[2].toInt()
         val x2 = matchResult.groupValues[3].toInt()
         val y2 = matchResult.groupValues[4].toInt()
 
-        // 计算并返回中心点
-        val centerX = (x1 + x2) / 2
-        val centerY = (y1 + y2) / 2
-
-        return Pair(centerX, centerY)
+        return Pair((x1 + x2) / 2, (y1 + y2) / 2)
     }
 }

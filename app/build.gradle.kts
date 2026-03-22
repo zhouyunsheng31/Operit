@@ -334,6 +334,10 @@ dependencies {
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
 
+    // UIAutomator Core (implementation required for in-process automation)
+    implementation("androidx.test.uiautomator:uiautomator:2.3.0")
+    implementation("androidx.test:core:1.5.0")
+
     // Tasker Plugin Library
     implementation("com.joaomgcd:taskerpluginlibrary:0.4.10")
     
