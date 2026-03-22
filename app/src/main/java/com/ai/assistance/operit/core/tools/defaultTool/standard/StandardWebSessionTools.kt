@@ -1,13 +1,13 @@
 package com.ai.assistance.operit.core.tools.defaultTool.standard
 
 import android.app.DownloadManager
+import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.graphics.Color as AndroidColor
-import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -15,13 +15,13 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.Base64
-import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
+import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
 import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
@@ -29,61 +29,17 @@ import android.webkit.WebResourceRequest
 import android.webkit.SslErrorHandler
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
-import android.widget.LinearLayout
-import android.widget.TextView
 import android.widget.Toast
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.offset
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.rotate
-import androidx.compose.ui.draw.scale
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.ComposeView
-import androidx.compose.ui.platform.ViewCompositionStrategy
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleOwner
-import androidx.lifecycle.LifecycleRegistry
-import androidx.lifecycle.ViewModelStore
-import androidx.lifecycle.ViewModelStoreOwner
-import androidx.lifecycle.setViewTreeLifecycleOwner
-import androidx.lifecycle.setViewTreeViewModelStoreOwner
-import androidx.savedstate.SavedStateRegistry
-import androidx.savedstate.SavedStateRegistryController
-import androidx.savedstate.SavedStateRegistryOwner
-import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.ai.assistance.operit.R
+import com.ai.assistance.operit.core.application.ActivityLifecycleManager
 import com.ai.assistance.operit.core.tools.StringResultData
 import com.ai.assistance.operit.core.tools.ToolExecutor
+import com.ai.assistance.operit.core.tools.defaultTool.websession.browser.WebSessionBrowserHost
+import com.ai.assistance.operit.core.tools.defaultTool.websession.browser.WebSessionBrowserState
+import com.ai.assistance.operit.core.tools.defaultTool.websession.browser.WebSessionBrowserTab
+import com.ai.assistance.operit.core.tools.defaultTool.websession.browser.WebSessionHistoryStore
+import com.ai.assistance.operit.core.tools.defaultTool.websession.browser.WebSessionPermissionRequestCoordinator
+import com.ai.assistance.operit.core.tools.defaultTool.websession.browser.WebSessionSessionHistoryItem
 import com.ai.assistance.operit.data.model.AITool
 import com.ai.assistance.operit.data.model.ToolResult
 import com.ai.assistance.operit.util.AppLogger
@@ -91,12 +47,19 @@ import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.LinkedHashSet
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -108,116 +71,45 @@ class StandardWebSessionTools(private val context: Context) : ToolExecutor {
         private const val DEFAULT_USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        private const val MOBILE_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
         private val mainHandler = Handler(Looper.getMainLooper())
 
         private val sessions = ConcurrentHashMap<String, WebSession>()
         private val sessionOrder = mutableListOf<String>()
-        private val tabViews = ConcurrentHashMap<String, LinearLayout>()
-        private val tabTitleViews = ConcurrentHashMap<String, TextView>()
-        private val tabCloseViews = ConcurrentHashMap<String, TextView>()
 
         private val sessionOrderLock = Any()
         private val overlayLock = Any()
+        private val sessionConfigLock = Any()
 
-        @Volatile private var overlayController: OverlayController? = null
+        @Volatile private var browserHost: WebSessionBrowserHost? = null
+        @Volatile private var activeSessionId: String? = null
+        @Volatile private var desktopModeEnabled: Boolean = true
+        @Volatile private var desktopModeInitialized: Boolean = false
     }
 
-private class WebSessionOverlayLifecycleOwner :
-    LifecycleOwner,
-    ViewModelStoreOwner,
-    SavedStateRegistryOwner {
-    private val lifecycleRegistry = LifecycleRegistry(this)
-    private val viewModelStoreField = ViewModelStore()
-    private val savedStateRegistryController = SavedStateRegistryController.create(this)
+    private val historyStore by lazy { WebSessionHistoryStore.getInstance(context.applicationContext) }
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            savedStateRegistryController.performRestore(null)
-        } else {
-            AppLogger.w(
-                "WebSessionOverlayLifecycleOwner",
-                "Initializing not on main thread. This may cause issues."
-            )
-        }
-    }
-
-    override val lifecycle: Lifecycle
-        get() = lifecycleRegistry
-
-    override val viewModelStore: ViewModelStore
-        get() = viewModelStoreField
-
-    override val savedStateRegistry: SavedStateRegistry
-        get() = savedStateRegistryController.savedStateRegistry
-
-    fun handleLifecycleEvent(event: Lifecycle.Event) {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            lifecycleRegistry.handleLifecycleEvent(event)
-        } else {
-            Handler(Looper.getMainLooper()).post {
-                lifecycleRegistry.handleLifecycleEvent(event)
-            }
-        }
-    }
-}
-
-    private class DeceptiveMinimizedLayout(context: Context) : FrameLayout(context) {
-        var minimizedMeasureEnabled: Boolean = false
-        var fakeWidthPx: Int = 1
-        var fakeHeightPx: Int = 1
-
-        init {
-            clipChildren = false
-            clipToPadding = false
-        }
-
-        fun setMinimizedMeasure(enabled: Boolean, fakeWidth: Int = fakeWidthPx, fakeHeight: Int = fakeHeightPx) {
-            minimizedMeasureEnabled = enabled
-            fakeWidthPx = fakeWidth.coerceAtLeast(1)
-            fakeHeightPx = fakeHeight.coerceAtLeast(1)
-            requestLayout()
-        }
-
-        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-            if (!minimizedMeasureEnabled) {
-                super.onMeasure(widthMeasureSpec, heightMeasureSpec)
-                return
-            }
-
-            val childWidthSpec =
-                View.MeasureSpec.makeMeasureSpec(fakeWidthPx, View.MeasureSpec.EXACTLY)
-            val childHeightSpec =
-                View.MeasureSpec.makeMeasureSpec(fakeHeightPx, View.MeasureSpec.EXACTLY)
-
-            for (i in 0 until childCount) {
-                getChildAt(i).measure(childWidthSpec, childHeightSpec)
-            }
-
-            setMeasuredDimension(1, 1)
-        }
-
-        override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
-            if (!minimizedMeasureEnabled) {
-                super.onLayout(changed, left, top, right, bottom)
-                return
-            }
-
-            for (i in 0 until childCount) {
-                getChildAt(i).layout(0, 0, fakeWidthPx, fakeHeightPx)
-            }
-        }
+        ensureDesktopModeInitialized()
     }
 
     private data class WebSession(
         val id: String,
         val webView: WebView,
         val sessionName: String?,
+        val customUserAgent: String? = null,
         val createdAt: Long = System.currentTimeMillis()
     ) {
         @Volatile var currentUrl: String = "about:blank"
         @Volatile var pageTitle: String = ""
         @Volatile var pageLoaded: Boolean = false
+        @Volatile var isLoading: Boolean = false
+        @Volatile var canGoBack: Boolean = false
+        @Volatile var canGoForward: Boolean = false
         @Volatile var hasSslError: Boolean = false
         @Volatile var pendingFileChooserCallback: ValueCallback<Array<Uri>>? = null
         @Volatile var lastFileChooserRequestAt: Long = 0L
@@ -277,25 +169,6 @@ private class WebSessionOverlayLifecycleOwner :
         }
     }
 
-    private data class OverlayController(
-        val appContext: Context,
-        val windowManager: WindowManager,
-        val rootView: DeceptiveMinimizedLayout,
-        val cardView: LinearLayout,
-        val titleView: TextView,
-        val tabsContainer: LinearLayout,
-        val webContainer: FrameLayout,
-        val minimizeButton: TextView,
-        val closeButton: TextView
-    ) {
-        var activeSessionId: String? = null
-        var overlayParams: WindowManager.LayoutParams? = null
-        var indicatorView: View? = null
-        var indicatorParams: WindowManager.LayoutParams? = null
-        var indicatorLifecycleOwner: WebSessionOverlayLifecycleOwner? = null
-        var isExpanded: Boolean = true
-    }
-
     override fun invoke(tool: AITool): ToolResult {
         return try {
             when (tool.name) {
@@ -323,30 +196,22 @@ private class WebSessionOverlayLifecycleOwner :
         }
 
         val initialUrl = param(tool, "url")?.takeIf { it.isNotBlank() } ?: "about:blank"
-        val userAgent = param(tool, "user_agent")?.takeIf { it.isNotBlank() } ?: DEFAULT_USER_AGENT
+        val requestedUserAgent = param(tool, "user_agent")?.takeIf { it.isNotBlank() }
         val headers = parseHeaders(param(tool, "headers"))
         val sessionName = param(tool, "session_name")?.takeIf { it.isNotBlank() }
 
         val sessionId = UUID.randomUUID().toString()
 
         runOnMainSync {
-            val session = createSessionOnMain(appContext, sessionId, sessionName, userAgent)
+            val session = createSessionOnMain(appContext, sessionId, sessionName, requestedUserAgent)
             sessions[sessionId] = session
             addSessionOrder(sessionId)
 
-            val controller = ensureOverlayOnMain(appContext, initialExpanded = false)
-            addSessionTabOnMain(controller, session)
-            activateSessionOnMain(controller, sessionId)
-            setExpandedOnMain(controller, false)
-
-            session.pageLoaded = false
-            session.currentUrl = initialUrl
-            session.hasSslError = false
-            if (headers.isNotEmpty()) {
-                session.webView.loadUrl(initialUrl, headers)
-            } else {
-                session.webView.loadUrl(initialUrl)
-            }
+            ensureOverlayOnMain(appContext, initialExpanded = false)
+            activeSessionId = sessionId
+            setExpandedOnMain(false)
+            navigateSessionOnMain(session, initialUrl, headers)
+            ensureSessionAttachedOnMain(sessionId)
         }
 
         val payload =
@@ -364,7 +229,7 @@ private class WebSessionOverlayLifecycleOwner :
         val closeAll = boolParam(tool, "close_all", false)
 
         if (closeAll) {
-            val ids = listSessionIdsInOrder().ifEmpty { sessions.keys().toList() }
+            val ids = listSessionIdsInOrder().ifEmpty { sessions.keys.toList() }
             var closed = 0
             ids.forEach { id ->
                 if (closeSession(id)) {
@@ -416,14 +281,7 @@ private class WebSessionOverlayLifecycleOwner :
 
         runOnMainSync {
             ensureSessionAttachedOnMain(session.id)
-            session.pageLoaded = false
-            session.currentUrl = targetUrl
-            session.hasSslError = false
-            if (headers.isNotEmpty()) {
-                session.webView.loadUrl(targetUrl, headers)
-            } else {
-                session.webView.loadUrl(targetUrl)
-            }
+            navigateSessionOnMain(session, targetUrl, headers)
         }
 
         val payload =
@@ -1069,11 +927,17 @@ private class WebSessionOverlayLifecycleOwner :
         appContext: Context,
         sessionId: String,
         sessionName: String?,
-        userAgent: String
+        customUserAgent: String?
     ): WebSession {
         val webView = WebView(appContext)
-        val session = WebSession(id = sessionId, webView = webView, sessionName = sessionName)
-        configureWebView(session, userAgent)
+        val session =
+            WebSession(
+                id = sessionId,
+                webView = webView,
+                sessionName = sessionName,
+                customUserAgent = customUserAgent
+            )
+        configureWebView(session, resolveUserAgent(customUserAgent))
         return session
     }
 
@@ -1082,18 +946,28 @@ private class WebSessionOverlayLifecycleOwner :
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
-            useWideViewPort = true
-            loadWithOverviewMode = true
+            setSupportMultipleWindows(true)
+            javaScriptCanOpenWindowsAutomatically = true
+            setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
-            userAgentString = userAgent
             allowFileAccess = true
             allowContentAccess = true
             cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+            setGeolocationEnabled(true)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                try {
+                    safeBrowsingEnabled = true
+                } catch (e: Throwable) {
+                    AppLogger.w(TAG, "Failed to enable safe browsing: ${e.message}")
+                }
             }
         }
+        applySessionUserAgent(session, userAgent)
+        configureCookiePolicy(session.webView)
 
         session.webView.apply {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
@@ -1111,6 +985,39 @@ private class WebSessionOverlayLifecycleOwner :
 
         session.webView.webChromeClient =
             object : WebChromeClient() {
+                override fun onCreateWindow(
+                    view: WebView?,
+                    isDialog: Boolean,
+                    isUserGesture: Boolean,
+                    resultMsg: android.os.Message?
+                ): Boolean {
+                    val message = resultMsg ?: return false
+                    val transport = message.obj as? WebView.WebViewTransport ?: return false
+                    val popupSession = runCatching { createPopupSessionOnMain(session) }.getOrNull() ?: return false
+                    transport.webView = popupSession.webView
+                    message.sendToTarget()
+                    setExpandedOnMain(true)
+                    refreshSessionUiOnMain(popupSession.id)
+                    return true
+                }
+
+                override fun onCloseWindow(window: WebView?) {
+                    super.onCloseWindow(window)
+                    val popupSession = window?.let(::findSessionByWebView)
+                    if (popupSession != null) {
+                        closeSession(popupSession.id)
+                    }
+                }
+
+                override fun onReceivedTitle(view: WebView?, title: String?) {
+                    super.onReceivedTitle(view, title)
+                    session.pageTitle = title.orEmpty()
+                    refreshSessionUiOnMain(session.id)
+                    ioScope.launch {
+                        historyStore.updateTitle(session.currentUrl, session.pageTitle)
+                    }
+                }
+
                 override fun onShowFileChooser(
                     webView: WebView?,
                     filePathCallback: ValueCallback<Array<Uri>>?,
@@ -1131,6 +1038,58 @@ private class WebSessionOverlayLifecycleOwner :
                     )
                     return true
                 }
+
+                override fun onPermissionRequest(request: PermissionRequest?) {
+                    if (request == null) {
+                        return
+                    }
+                    handleWebPermissionRequest(request)
+                }
+
+                override fun onGeolocationPermissionsShowPrompt(
+                    origin: String?,
+                    callback: GeolocationPermissions.Callback?
+                ) {
+                    if (origin.isNullOrBlank() || callback == null) {
+                        callback?.invoke(origin.orEmpty(), false, false)
+                        return
+                    }
+                    handleGeolocationPermissionRequest(origin, callback)
+                }
+
+                override fun onJsAlert(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    result: android.webkit.JsResult?
+                ): Boolean {
+                    AppLogger.d(TAG, "web_session js alert: ${message.orEmpty()}")
+                    result?.confirm()
+                    return true
+                }
+
+                override fun onJsConfirm(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    result: android.webkit.JsResult?
+                ): Boolean {
+                    AppLogger.d(TAG, "web_session js confirm: ${message.orEmpty()}")
+                    result?.confirm()
+                    return true
+                }
+
+                override fun onJsPrompt(
+                    view: WebView?,
+                    url: String?,
+                    message: String?,
+                    defaultValue: String?,
+                    result: android.webkit.JsPromptResult?
+                ): Boolean {
+                    AppLogger.d(TAG, "web_session js prompt: ${message.orEmpty()}")
+                    result?.confirm(defaultValue)
+                    return true
+                }
             }
 
         session.webView.webViewClient =
@@ -1139,8 +1098,15 @@ private class WebSessionOverlayLifecycleOwner :
                     super.onPageStarted(view, url, favicon)
                     session.currentUrl = url
                     session.pageLoaded = false
+                    session.isLoading = true
                     session.hasSslError = false
-                    refreshSessionUiOnMain(session.id)
+                    syncNavigationStateUi(session)
+                }
+
+                override fun onPageCommitVisible(view: WebView, url: String) {
+                    super.onPageCommitVisible(view, url)
+                    session.currentUrl = url
+                    refreshNavigationStateFromWebView(view, session)
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
@@ -1148,8 +1114,12 @@ private class WebSessionOverlayLifecycleOwner :
                     session.currentUrl = url
                     session.pageTitle = view.title ?: ""
                     session.pageLoaded = true
+                    session.isLoading = false
+                    refreshNavigationStateFromWebView(view, session)
                     injectDownloadHelper(view)
-                    refreshSessionUiOnMain(session.id)
+                    ioScope.launch {
+                        historyStore.updateTitle(url, session.pageTitle)
+                    }
                 }
 
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
@@ -1169,11 +1139,17 @@ private class WebSessionOverlayLifecycleOwner :
                         )
                         return true
                     }
-                    if (scheme != "http" && scheme != "https") {
-                        AppLogger.w(TAG, "Blocked non-http(s) navigation: $uri")
-                        return true
+                    return handleNavigationOverrideOnMain(session, uri)
+                }
+
+                override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    session.currentUrl = url
+                    val pageTitle = view.title.orEmpty()
+                    refreshNavigationStateFromWebView(view, session)
+                    ioScope.launch {
+                        historyStore.recordVisit(url, pageTitle, isReload)
                     }
-                    return false
                 }
 
                 override fun onReceivedSslError(
@@ -1187,6 +1163,7 @@ private class WebSessionOverlayLifecycleOwner :
                             "session=${session.id}, url=${error.url}, primaryError=${error.primaryError}"
                     )
                     session.hasSslError = true
+                    updateNavigationState(session)
                     refreshSessionUiOnMain(session.id)
                     handler.proceed()
                 }
@@ -1196,712 +1173,620 @@ private class WebSessionOverlayLifecycleOwner :
     private fun ensureOverlayOnMain(
         appContext: Context,
         initialExpanded: Boolean = true
-    ): OverlayController {
-        overlayController?.let { return it }
+    ): WebSessionBrowserHost {
+        browserHost?.let { return it }
 
         synchronized(overlayLock) {
-            overlayController?.let { return it }
+            browserHost?.let { return it }
 
-            val windowManager = appContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-
-            val rootView =
-                DeceptiveMinimizedLayout(appContext).apply {
-                    setBackgroundColor(AndroidColor.argb(110, 0, 0, 0))
-                    setOnClickListener {}
-                }
-
-            val cardView =
-                LinearLayout(appContext).apply {
-                    orientation = LinearLayout.VERTICAL
-                    background =
-                        GradientDrawable().apply {
-                            shape = GradientDrawable.RECTANGLE
-                            cornerRadius = dp(16).toFloat()
-                            setColor(AndroidColor.WHITE)
-                        }
-                }
-
-            val cardLp =
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                ).apply {
-                    setMargins(dp(8), dp(24), dp(8), dp(8))
-                }
-            rootView.addView(cardView, cardLp)
-
-            val topBar =
-                LinearLayout(appContext).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    setPadding(dp(12), dp(8), dp(8), dp(8))
-                    setBackgroundColor(AndroidColor.parseColor("#F3F5F8"))
-                    gravity = Gravity.CENTER_VERTICAL
-                }
-
-            val titleView =
-                TextView(appContext).apply {
-                    text = "Web Sessions"
-                    textSize = 14f
-                    setTextColor(AndroidColor.parseColor("#111827"))
-                    maxLines = 1
-                }
-
-            val minimizeButton =
-                TextView(appContext).apply {
-                    text = "—"
-                    textSize = 18f
-                    setTextColor(AndroidColor.parseColor("#6B7280"))
-                    setPadding(dp(10), dp(2), dp(10), dp(2))
-                    contentDescription = appContext.getString(R.string.web_session_accessibility_minimize_panel)
-                }
-
-            val closeButton =
-                TextView(appContext).apply {
-                    text = "✕"
-                    textSize = 16f
-                    setTextColor(AndroidColor.parseColor("#6B7280"))
-                    setPadding(dp(8), dp(2), dp(8), dp(2))
-                    contentDescription = appContext.getString(R.string.web_session_accessibility_close_current_session)
-                }
-
-            topBar.addView(
-                titleView,
-                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            )
-            topBar.addView(
-                minimizeButton,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-            topBar.addView(
-                closeButton,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-
-            cardView.addView(
-                topBar,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-
-            val tabsScroll =
-                HorizontalScrollView(appContext).apply {
-                    isHorizontalScrollBarEnabled = false
-                    setBackgroundColor(AndroidColor.parseColor("#FAFBFC"))
-                }
-
-            val tabsContainer =
-                LinearLayout(appContext).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    setPadding(dp(8), dp(6), dp(8), dp(6))
-                }
-
-            tabsScroll.addView(
-                tabsContainer,
-                ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            )
-
-            cardView.addView(
-                tabsScroll,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                )
-            )
-
-            val webContainer =
-                FrameLayout(appContext).apply {
-                    setBackgroundColor(AndroidColor.WHITE)
-                }
-
-            cardView.addView(
-                webContainer,
-                LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    0,
-                    1f
-                )
-            )
-
-            val controller =
-                OverlayController(
+            val host =
+                WebSessionBrowserHost(
                     appContext = appContext,
-                    windowManager = windowManager,
-                    rootView = rootView,
-                    cardView = cardView,
-                    titleView = titleView,
-                    tabsContainer = tabsContainer,
-                    webContainer = webContainer,
-                    minimizeButton = minimizeButton,
-                    closeButton = closeButton
+                    store = historyStore,
+                    callbacks = createBrowserHostCallbacks(appContext)
                 )
-
-            controller.isExpanded = initialExpanded
-            controller.overlayParams = createOverlayLayoutParamsOnMain(expanded = initialExpanded)
-            windowManager.addView(rootView, controller.overlayParams)
-
-            minimizeButton.setOnClickListener {
-                setExpandedOnMain(controller, false)
-            }
-            closeButton.setOnClickListener {
-                controller.activeSessionId?.let { closeSession(it) }
-            }
-
-            overlayController = controller
-            return controller
+            browserHost = host
+            host.ensureCreated(initialExpanded = initialExpanded)
+            refreshSessionUiOnMain()
+            return host
         }
     }
+
+    private fun createBrowserHostCallbacks(appContext: Context): WebSessionBrowserHost.Callbacks =
+        object : WebSessionBrowserHost.Callbacks {
+            override fun onNavigate(url: String) {
+                runOnMainSync {
+                    openUrlOnMain(appContext, url)
+                }
+            }
+
+            override fun onBack() {
+                runOnMainSync {
+                    val session = getActiveSessionOnMain() ?: return@runOnMainSync
+                    ensureSessionAttachedOnMain(session.id)
+                    if (session.webView.canGoBack()) {
+                        session.webView.goBack()
+                    }
+                    refreshNavigationStateAsync(session)
+                }
+            }
+
+            override fun onForward() {
+                runOnMainSync {
+                    val session = getActiveSessionOnMain() ?: return@runOnMainSync
+                    ensureSessionAttachedOnMain(session.id)
+                    if (session.webView.canGoForward()) {
+                        session.webView.goForward()
+                    }
+                    refreshNavigationStateAsync(session)
+                }
+            }
+
+            override fun onRefreshOrStop() {
+                runOnMainSync {
+                    val session = getActiveSessionOnMain() ?: return@runOnMainSync
+                    ensureSessionAttachedOnMain(session.id)
+                    if (session.isLoading) {
+                        session.webView.stopLoading()
+                        session.isLoading = false
+                    } else {
+                        session.pageLoaded = false
+                        session.isLoading = true
+                        session.webView.reload()
+                    }
+                    refreshNavigationStateAsync(session)
+                }
+            }
+
+            override fun onSelectTab(sessionId: String) {
+                runOnMainSync {
+                    ensureSessionAttachedOnMain(sessionId)
+                }
+            }
+
+            override fun onCloseTab(sessionId: String) {
+                closeSession(sessionId)
+            }
+
+            override fun onNewTab() {
+                runOnMainSync {
+                    createSessionTabOnMain(appContext, initialUrl = "about:blank")
+                }
+            }
+
+            override fun onMinimize() {
+                runOnMainSync {
+                    setExpandedOnMain(false)
+                }
+            }
+
+            override fun onCloseCurrentTab() {
+                activeSessionId?.let { closeSession(it) }
+            }
+
+            override fun onCloseAllTabs() {
+                val ids = listSessionIdsInOrder().ifEmpty { sessions.keys.toList() }
+                ids.forEach { closeSession(it) }
+            }
+
+            override fun onToggleBookmark(url: String, title: String) {
+                ioScope.launch {
+                    historyStore.toggleBookmark(url, title)
+                }
+            }
+
+            override fun onRemoveBookmark(url: String) {
+                ioScope.launch {
+                    historyStore.removeBookmark(url)
+                }
+            }
+
+            override fun onSelectSessionHistory(index: Int) {
+                runOnMainSync {
+                    val session = getActiveSessionOnMain() ?: return@runOnMainSync
+                    ensureSessionAttachedOnMain(session.id)
+                    val historyList = session.webView.copyBackForwardList()
+                    val delta = index - historyList.currentIndex
+                    if (delta != 0 && session.webView.canGoBackOrForward(delta)) {
+                        session.webView.goBackOrForward(delta)
+                        refreshNavigationStateAsync(session)
+                    }
+                }
+            }
+
+            override fun onOpenUrl(url: String) {
+                runOnMainSync {
+                    openUrlOnMain(appContext, url)
+                }
+            }
+
+            override fun onClearHistory() {
+                ioScope.launch {
+                    historyStore.clearHistory()
+                }
+            }
+
+            override fun onToggleDesktopMode() {
+                setDesktopModeEnabled(!desktopModeEnabled)
+            }
+        }
 
     private fun destroyOverlayOnMain() {
-        val controller = overlayController ?: return
-
-        hideIndicatorOnMain(controller)
-
-        try {
-            controller.windowManager.removeView(controller.rootView)
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "Error removing overlay: ${e.message}")
-        }
-
-        overlayController = null
-        tabViews.clear()
-        tabTitleViews.clear()
-        tabCloseViews.clear()
+        browserHost?.destroy()
+        browserHost = null
+        activeSessionId = null
     }
 
-    private fun createOverlayLayoutParamsOnMain(expanded: Boolean): WindowManager.LayoutParams {
-        val type =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            } else {
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_PHONE
-            }
-
-        return if (expanded) {
-            WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.MATCH_PARENT,
-                type,
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.CENTER
-                x = 0
-                y = 0
-            }
-        } else {
-            WindowManager.LayoutParams(
-                1,
-                1,
-                type,
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.TOP or Gravity.START
-                x = dp(16)
-                y = dp(16)
-            }
-        }
-    }
-
-    private fun createIndicatorLayoutParamsOnMain(): WindowManager.LayoutParams {
-        val type =
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-            } else {
-                @Suppress("DEPRECATION")
-                WindowManager.LayoutParams.TYPE_PHONE
-            }
-
-        val size = dp(40).coerceAtLeast(1)
-        return WindowManager.LayoutParams(
-            size,
-            size,
-            type,
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = dp(16)
-            y = dp(16)
-        }
-    }
-
-    @Composable
-    private fun MinimizedIndicator(
-        onToggleFullscreen: () -> Unit,
-        onDragBy: (dx: Int, dy: Int) -> Unit
-    ) {
-        val transition = rememberInfiniteTransition(label = "web-session-indicator")
-        val primaryColor = MaterialTheme.colorScheme.primary
-
-        val bobbingDp by
-            transition.animateFloat(
-                initialValue = -2f,
-                targetValue = 2f,
-                animationSpec =
-                    infiniteRepeatable(
-                        animation = tween(durationMillis = 900, easing = LinearEasing),
-                        repeatMode = RepeatMode.Reverse
-                    ),
-                label = "bobbing"
-            )
-
-        val wiggleDeg by
-            transition.animateFloat(
-                initialValue = -8f,
-                targetValue = 8f,
-                animationSpec =
-                    infiniteRepeatable(
-                        animation = tween(durationMillis = 1200, easing = LinearEasing),
-                        repeatMode = RepeatMode.Reverse
-                    ),
-                label = "wiggle"
-            )
-
-        val pulse by
-            transition.animateFloat(
-                initialValue = 0.96f,
-                targetValue = 1.04f,
-                animationSpec =
-                    infiniteRepeatable(
-                        animation = tween(durationMillis = 1100, easing = LinearEasing),
-                        repeatMode = RepeatMode.Reverse
-                    ),
-                label = "pulse"
-            )
-
-        val minimizedIndicatorDescription =
-            stringResource(R.string.web_session_accessibility_minimized_indicator)
-
-        Surface(
-            shape = CircleShape,
-            color = Color.Transparent,
-            tonalElevation = 0.dp,
-            shadowElevation = 0.dp,
-            modifier =
-                Modifier
-                    .fillMaxSize()
-                    .clip(CircleShape)
-                    .pointerInput(Unit) {
-                        detectDragGestures { _, dragAmount ->
-                            onDragBy(dragAmount.x.roundToInt(), dragAmount.y.roundToInt())
-                        }
-                    }
-                    .semantics {
-                        contentDescription = minimizedIndicatorDescription
-                    }
-                    .clickable { onToggleFullscreen() }
-        ) {
-            Box(
-                modifier =
-                    Modifier
-                        .fillMaxSize()
-                        .scale(pulse)
-                        .drawBehind {
-                            val radius = size.minDimension / 2f
-                            drawCircle(
-                                brush =
-                                    Brush.radialGradient(
-                                        colors =
-                                            listOf(
-                                                Color.White.copy(alpha = 0.40f),
-                                                primaryColor.copy(alpha = 0.16f),
-                                                Color.Transparent
-                                            ),
-                                        center = Offset(size.width * 0.30f, size.height * 0.28f),
-                                        radius = radius * 1.15f
-                                    ),
-                                radius = radius
-                            )
-
-                            drawCircle(
-                                color = Color.White.copy(alpha = 0.20f),
-                                radius = radius * 0.22f,
-                                center = Offset(size.width * 0.28f, size.height * 0.28f)
-                            )
-
-                            drawCircle(
-                                color = Color.White.copy(alpha = 0.08f),
-                                radius = radius * 0.90f,
-                                center = Offset(size.width * 0.55f, size.height * 0.62f)
-                            )
-                        }
-                        .border(
-                            width = 1.dp,
-                            color = Color.White.copy(alpha = 0.35f),
-                            shape = CircleShape
-                        ),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "🌐",
-                    color = primaryColor,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.offset(y = bobbingDp.dp).rotate(wiggleDeg)
-                )
-            }
-        }
-    }
-
-    private fun showIndicatorOnMain(controller: OverlayController) {
-        if (controller.indicatorView != null) {
-            return
-        }
-
-        val params = controller.indicatorParams ?: createIndicatorLayoutParamsOnMain().also {
-            controller.indicatorParams = it
-        }
-
-        val lifecycleOwner =
-            WebSessionOverlayLifecycleOwner().apply {
-                handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
-                handleLifecycleEvent(Lifecycle.Event.ON_START)
-                handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
-            }
-
-        val indicator =
-            ComposeView(controller.appContext).apply {
-                setBackgroundColor(AndroidColor.TRANSPARENT)
-                setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
-                setViewTreeLifecycleOwner(lifecycleOwner)
-                setViewTreeViewModelStoreOwner(lifecycleOwner)
-                setViewTreeSavedStateRegistryOwner(lifecycleOwner)
-                setContent {
-                    MaterialTheme {
-                        MinimizedIndicator(
-                            onToggleFullscreen = { setExpandedOnMain(controller, true) },
-                            onDragBy = { dx, dy -> moveIndicatorByOnMain(controller, dx, dy) }
-                        )
-                    }
-                }
-            }
-
-        controller.indicatorLifecycleOwner = lifecycleOwner
-        controller.indicatorView = indicator
-        controller.windowManager.addView(indicator, params)
-    }
-
-    private fun hideIndicatorOnMain(controller: OverlayController) {
-        val indicator = controller.indicatorView ?: return
-
-        controller.indicatorLifecycleOwner?.let { owner ->
-            owner.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-            owner.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
-            owner.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-        }
-
-        try {
-            controller.windowManager.removeView(indicator)
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "Error removing indicator: ${e.message}")
-        }
-
-        controller.indicatorView = null
-        controller.indicatorLifecycleOwner = null
-    }
-
-    private fun moveIndicatorByOnMain(controller: OverlayController, dx: Int, dy: Int) {
-        val indicator = controller.indicatorView ?: return
-        val params = controller.indicatorParams ?: return
-
-        val maxX = (context.resources.displayMetrics.widthPixels - params.width).coerceAtLeast(0)
-        val maxY = (context.resources.displayMetrics.heightPixels - params.height).coerceAtLeast(0)
-
-        params.x = (params.x + dx).coerceIn(0, maxX)
-        params.y = (params.y + dy).coerceIn(0, maxY)
-
-        controller.indicatorParams = params
-        controller.windowManager.updateViewLayout(indicator, params)
-        syncOverlayPositionWhenMinimizedOnMain(controller)
-    }
-
-    private fun syncOverlayPositionWhenMinimizedOnMain(controller: OverlayController) {
-        if (controller.isExpanded) {
-            return
-        }
-
-        val overlayView = controller.rootView
-        val overlayParams = controller.overlayParams ?: return
-        val indicatorParams = controller.indicatorParams ?: return
-
-        overlayParams.x = indicatorParams.x
-        overlayParams.y = indicatorParams.y
-        controller.overlayParams = overlayParams
-
-        if (overlayView.windowToken != null) {
-            controller.windowManager.updateViewLayout(overlayView, overlayParams)
-        }
-    }
-
-    private fun setExpandedOnMain(controller: OverlayController, expanded: Boolean) {
-        val params = controller.overlayParams ?: return
-        controller.isExpanded = expanded
-
+    private fun setExpandedOnMain(expanded: Boolean) {
+        browserHost?.setExpanded(expanded)
+        keepActiveWebViewRunningOnMain(expanded)
         if (expanded) {
-            controller.rootView.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
-            controller.rootView.setMinimizedMeasure(false)
-            controller.rootView.setBackgroundColor(AndroidColor.argb(110, 0, 0, 0))
-            controller.cardView.visibility = View.VISIBLE
-            controller.cardView.alpha = 1f
-
-            params.width = WindowManager.LayoutParams.MATCH_PARENT
-            params.height = WindowManager.LayoutParams.MATCH_PARENT
-            params.gravity = Gravity.CENTER
-            params.x = 0
-            params.y = 0
-            params.flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-            hideIndicatorOnMain(controller)
-        } else {
-            if (controller.indicatorView == null) {
-                showIndicatorOnMain(controller)
-            }
-
-            controller.rootView.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
-            val displayMetrics = context.resources.displayMetrics
-            controller.rootView.setMinimizedMeasure(
-                enabled = true,
-                fakeWidth = displayMetrics.widthPixels,
-                fakeHeight = displayMetrics.heightPixels
-            )
-            controller.rootView.setBackgroundColor(AndroidColor.TRANSPARENT)
-            controller.cardView.visibility = View.VISIBLE
-            controller.cardView.alpha = 0.01f
-
-            params.width = 1
-            params.height = 1
-            params.gravity = Gravity.TOP or Gravity.START
-            params.flags =
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-
-            controller.indicatorParams?.let {
-                params.x = it.x
-                params.y = it.y
-            }
-        }
-
-        keepActiveWebViewRunningOnMain(controller, expanded)
-
-        controller.overlayParams = params
-        if (controller.rootView.windowToken != null) {
-            controller.windowManager.updateViewLayout(controller.rootView, params)
+            refreshSessionUiOnMain()
         }
     }
 
-    private fun keepActiveWebViewRunningOnMain(controller: OverlayController, expanded: Boolean) {
-        val activeSessionId = controller.activeSessionId ?: return
-        val webView = sessions[activeSessionId]?.webView ?: return
-
+    private fun keepActiveWebViewRunningOnMain(expanded: Boolean) {
+        val session = getActiveSessionOnMain() ?: return
         try {
-            webView.onResume()
-            webView.resumeTimers()
-            webView.visibility = View.VISIBLE
-            webView.alpha = 1f
+            session.webView.onResume()
+            session.webView.resumeTimers()
+            session.webView.visibility = View.VISIBLE
+            session.webView.alpha = 1f
             if (expanded) {
-                if (!webView.hasFocus()) {
-                    webView.requestFocus()
+                if (!session.webView.hasFocus()) {
+                    session.webView.requestFocus()
                 }
             } else {
-                webView.clearFocus()
+                session.webView.clearFocus()
             }
         } catch (e: Exception) {
             AppLogger.w(TAG, "Failed to keep active WebView running: ${e.message}")
         }
     }
 
-    private fun addSessionTabOnMain(controller: OverlayController, session: WebSession) {
-        if (tabViews[session.id] != null) {
-            refreshSessionUiOnMain(session.id)
-            return
-        }
+    private fun createSessionTabOnMain(
+        appContext: Context,
+        initialUrl: String,
+        sessionName: String? = null,
+        customUserAgent: String? = null
+    ): WebSession {
+        val sessionId = UUID.randomUUID().toString()
+        val session = createSessionOnMain(appContext, sessionId, sessionName, customUserAgent)
+        sessions[sessionId] = session
+        addSessionOrder(sessionId)
+        activeSessionId = sessionId
+        ensureOverlayOnMain(appContext)
+        navigateSessionOnMain(session, initialUrl)
+        ensureSessionAttachedOnMain(sessionId)
+        return session
+    }
 
-        val tabTitleView =
-            TextView(controller.appContext).apply {
-                textSize = 12f
-                maxLines = 1
-                text = tabLabel(session)
-            }
-
-        val tabCloseView =
-            TextView(controller.appContext).apply {
-                text = "✕"
-                textSize = 11f
-                setPadding(dp(6), 0, dp(2), 0)
-                setOnClickListener {
-                    closeSession(session.id)
-                }
-            }
-
-        val tabView =
-            LinearLayout(controller.appContext).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(6), dp(6), dp(6))
-                addView(
-                    tabTitleView,
-                    LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    )
-                )
-                addView(
-                    tabCloseView,
-                    LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    )
-                )
-                setOnClickListener {
-                    runOnMainSync {
-                        activateSessionOnMain(controller, session.id)
-                    }
-                }
-            }
-
-        tabViews[session.id] = tabView
-        tabTitleViews[session.id] = tabTitleView
-        tabCloseViews[session.id] = tabCloseView
-
-        val lp =
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                marginEnd = dp(8)
-            }
-        controller.tabsContainer.addView(tabView, lp)
-
+    private fun navigateSessionOnMain(
+        session: WebSession,
+        targetUrl: String,
+        headers: Map<String, String> = emptyMap()
+    ) {
+        session.pageLoaded = false
+        session.isLoading = true
+        session.currentUrl = targetUrl
+        session.hasSslError = false
+        updateNavigationState(session)
         refreshSessionUiOnMain(session.id)
-    }
-
-    private fun removeSessionTabOnMain(controller: OverlayController, sessionId: String) {
-        val tab = tabViews.remove(sessionId) ?: return
-        tabTitleViews.remove(sessionId)
-        tabCloseViews.remove(sessionId)
-        try {
-            controller.tabsContainer.removeView(tab)
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "Error removing tab for $sessionId: ${e.message}")
+        if (headers.isNotEmpty()) {
+            session.webView.loadUrl(targetUrl, headers)
+        } else {
+            session.webView.loadUrl(targetUrl)
         }
+        refreshNavigationStateAsync(session)
     }
 
-    private fun activateSessionOnMain(controller: OverlayController, sessionId: String) {
+    private fun openUrlOnMain(appContext: Context, url: String) {
+        val existingSession = getActiveSessionOnMain()
+        val session = existingSession ?: createSessionTabOnMain(appContext, initialUrl = url)
+        if (existingSession != null) {
+            navigateSessionOnMain(session, url)
+        }
+        ensureSessionAttachedOnMain(session.id)
+    }
+
+    private fun activateSessionOnMain(sessionId: String) {
         val session = sessions[sessionId] ?: return
-
-        val parent = session.webView.parent
-        if (parent is ViewGroup && parent !== controller.webContainer) {
-            parent.removeView(session.webView)
-        }
-
-        controller.webContainer.removeAllViews()
-        if (session.webView.parent == null) {
-            controller.webContainer.addView(
-                session.webView,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT
-                )
-            )
-        }
-
-        controller.activeSessionId = sessionId
-        controller.titleView.text = headerTitle(session)
-        refreshTabStylesOnMain(controller)
+        ensureOverlayOnMain(context.applicationContext)
+        activeSessionId = sessionId
+        browserHost?.attachActiveWebView(session.webView)
+        updateNavigationState(session)
+        refreshSessionUiOnMain(session.id)
     }
 
     private fun ensureSessionAttachedOnMain(sessionId: String) {
         val session = sessions[sessionId] ?: return
-        val controller = ensureOverlayOnMain(context.applicationContext)
-        if (tabViews[session.id] == null) {
-            addSessionTabOnMain(controller, session)
+        ensureOverlayOnMain(context.applicationContext)
+        activeSessionId = sessionId
+        browserHost?.attachActiveWebView(session.webView)
+        runCatching {
+            session.webView.onResume()
+            session.webView.resumeTimers()
+            session.webView.visibility = View.VISIBLE
+            session.webView.alpha = 1f
         }
-        activateSessionOnMain(controller, sessionId)
+        updateNavigationState(session)
+        refreshSessionUiOnMain(session.id)
     }
 
-    private fun refreshTabStylesOnMain(controller: OverlayController) {
-        val activeId = controller.activeSessionId
-        tabViews.forEach { (id, tab) ->
-            val active = id == activeId
-            val titleView = tabTitleViews[id]
-            val closeView = tabCloseViews[id]
+    private fun refreshSessionUiOnMain(sessionId: String? = null) {
+        sessionId?.let { id ->
+            sessions[id]?.let(::updateNavigationState)
+        }
 
-            titleView?.setTextColor(
-                if (active) AndroidColor.WHITE else AndroidColor.parseColor("#334155")
-            )
-            closeView?.setTextColor(
-                if (active) AndroidColor.parseColor("#DBEAFE") else AndroidColor.parseColor("#64748B")
-            )
+        val host = browserHost ?: return
+        val resolvedActiveId = resolvePreferredSessionId()
+        activeSessionId = resolvedActiveId
+        host.attachActiveWebView(resolvedActiveId?.let { sessions[it]?.webView })
+        host.updateBrowserState(buildBrowserState(resolvedActiveId))
+    }
 
-            tab.background =
-                GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dp(12).toFloat()
-                    setColor(
-                        if (active) {
-                            AndroidColor.parseColor("#2563EB")
-                        } else {
-                            AndroidColor.parseColor("#E2E8F0")
-                        }
+    private fun buildBrowserState(preferredSessionId: String?): WebSessionBrowserState {
+        val activeId =
+            preferredSessionId?.takeIf { sessions.containsKey(it) }
+                ?: listSessionIdsInOrder().firstOrNull { sessions.containsKey(it) }
+                ?: sessions.keys.firstOrNull()
+        val activeSession = activeId?.let { sessions[it] }
+        val orderedIds =
+            linkedSetOf<String>().apply {
+                addAll(listSessionIdsInOrder())
+                addAll(sessions.keys)
+            }
+
+        return WebSessionBrowserState(
+            activeSessionId = activeId,
+            pageTitle = activeSession?.pageTitle.orEmpty(),
+            currentUrl = activeSession?.currentUrl?.ifBlank { "about:blank" } ?: "about:blank",
+            canGoBack = activeSession?.canGoBack == true,
+            canGoForward = activeSession?.canGoForward == true,
+            isLoading = activeSession?.isLoading == true,
+            hasSslError = activeSession?.hasSslError == true,
+            isDesktopMode = desktopModeEnabled,
+            tabs =
+                orderedIds.mapNotNull { id ->
+                    sessions[id]?.let { session ->
+                        WebSessionBrowserTab(
+                            sessionId = session.id,
+                            title = sessionDisplayTitle(session),
+                            url = session.currentUrl.ifBlank { "about:blank" },
+                            isActive = session.id == activeId,
+                            hasSslError = session.hasSslError
+                        )
+                    }
+                },
+            sessionHistory =
+                activeSession?.let { buildSessionHistory(it.webView) } ?: emptyList()
+        )
+    }
+
+    private fun buildSessionHistory(webView: WebView): List<WebSessionSessionHistoryItem> {
+        val historyList = webView.copyBackForwardList()
+        if (historyList.size == 0) {
+            return emptyList()
+        }
+
+        return buildList(historyList.size) {
+            for (index in 0 until historyList.size) {
+                val item = historyList.getItemAtIndex(index)
+                val url = item?.url.orEmpty().ifBlank { "about:blank" }
+                val title = item?.title.orEmpty().ifBlank { url }
+                add(
+                    WebSessionSessionHistoryItem(
+                        index = index,
+                        title = title,
+                        url = url,
+                        isCurrent = index == historyList.currentIndex
                     )
-                }
+                )
+            }
         }
     }
 
-    private fun refreshSessionUiOnMain(sessionId: String) {
-        val session = sessions[sessionId] ?: return
-        tabTitleViews[sessionId]?.text = tabLabel(session)
-
-        val controller = overlayController ?: return
-        if (controller.activeSessionId == sessionId) {
-            controller.titleView.text = headerTitle(session)
-        }
-        refreshTabStylesOnMain(controller)
-    }
-
-    private fun tabLabel(session: WebSession): String {
-        val index = indexOfSession(session.id)
+    private fun sessionDisplayTitle(session: WebSession): String {
         val base =
             when {
                 session.pageTitle.isNotBlank() -> session.pageTitle
                 !session.sessionName.isNullOrBlank() -> session.sessionName
                 session.currentUrl.isNotBlank() -> session.currentUrl
-                else -> "Session"
+                else -> "about:blank"
             }
-        val short = shorten(base, 16)
         val sslBadge = context.getString(R.string.web_ssl_error_badge)
-        val withSslPrefix = if (session.hasSslError) "$sslBadge · $short" else short
-        return if (index > 0) "$index · $withSslPrefix" else withSslPrefix
+        return if (session.hasSslError) "$sslBadge · $base" else base
     }
 
-    private fun headerTitle(session: WebSession): String {
-        val title =
-            when {
-                session.pageTitle.isNotBlank() -> session.pageTitle
-                !session.sessionName.isNullOrBlank() -> session.sessionName
-                session.currentUrl.isNotBlank() -> session.currentUrl
-                else -> "Web Session"
+    private fun getActiveSessionOnMain(): WebSession? =
+        resolvePreferredSessionId()?.let { sessions[it] }
+
+    private fun updateNavigationState(session: WebSession) {
+        session.canGoBack = runCatching { session.webView.canGoBack() }.getOrDefault(false)
+        session.canGoForward = runCatching { session.webView.canGoForward() }.getOrDefault(false)
+    }
+
+    private fun syncNavigationStateUi(session: WebSession) {
+        updateNavigationState(session)
+        refreshSessionUiOnMain(session.id)
+    }
+
+    private fun refreshNavigationStateFromWebView(view: WebView, session: WebSession) {
+        syncNavigationStateUi(session)
+        view.post {
+            if (session.webView === view) {
+                syncNavigationStateUi(session)
             }
-        val sslBadge = context.getString(R.string.web_ssl_error_badge)
-        val withSslPrefix = if (session.hasSslError) "$sslBadge · $title" else title
-        return shorten(withSslPrefix, 42)
+        }
+    }
+
+    private fun refreshNavigationStateAsync(session: WebSession) {
+        session.webView.post {
+            syncNavigationStateUi(session)
+        }
+    }
+
+    private fun ensureDesktopModeInitialized() {
+        if (desktopModeInitialized) {
+            return
+        }
+
+        synchronized(sessionConfigLock) {
+            if (desktopModeInitialized) {
+                return
+            }
+            desktopModeEnabled =
+                runBlocking(Dispatchers.IO) {
+                    historyStore.desktopModeFlow.first()
+                }
+            desktopModeInitialized = true
+        }
+    }
+
+    private fun resolveUserAgent(customUserAgent: String?): String =
+        customUserAgent ?: if (desktopModeEnabled) DEFAULT_USER_AGENT else MOBILE_USER_AGENT
+
+    private fun applySessionUserAgent(session: WebSession, userAgent: String) {
+        with(session.webView.settings) {
+            userAgentString = userAgent
+            useWideViewPort = desktopModeEnabled
+            loadWithOverviewMode = desktopModeEnabled
+        }
+    }
+
+    private fun configureCookiePolicy(webView: WebView) {
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            cookieManager.setAcceptThirdPartyCookies(webView, true)
+        }
+    }
+
+    private fun createPopupSessionOnMain(parentSession: WebSession): WebSession {
+        val popupSession =
+            createSessionOnMain(
+                appContext = context.applicationContext,
+                sessionId = UUID.randomUUID().toString(),
+                sessionName = parentSession.sessionName,
+                customUserAgent = parentSession.customUserAgent
+            )
+        sessions[popupSession.id] = popupSession
+        addSessionOrder(popupSession.id)
+        activeSessionId = popupSession.id
+        ensureOverlayOnMain(context.applicationContext)
+        browserHost?.attachActiveWebView(popupSession.webView)
+        refreshSessionUiOnMain(popupSession.id)
+        return popupSession
+    }
+
+    private fun findSessionByWebView(webView: WebView): WebSession? =
+        sessions.values.firstOrNull { it.webView === webView }
+
+    private fun handleNavigationOverrideOnMain(session: WebSession, uri: Uri): Boolean {
+        val rawUrl = uri.toString()
+        val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return false
+        return when (scheme) {
+            "http", "https" -> false
+            "about" -> false
+            "intent" -> handleIntentSchemeOnMain(session, rawUrl)
+            else -> {
+                if (!openExternalIntentOnMain(Intent(Intent.ACTION_VIEW, uri))) {
+                    showToast(context.getString(R.string.web_session_external_open_failed, rawUrl))
+                }
+                true
+            }
+        }
+    }
+
+    private fun handleIntentSchemeOnMain(session: WebSession, rawUrl: String): Boolean {
+        val intent =
+            runCatching { Intent.parseUri(rawUrl, Intent.URI_INTENT_SCHEME) }.getOrElse { error ->
+                AppLogger.w(TAG, "Failed to parse intent url: ${error.message}")
+                showToast(context.getString(R.string.web_session_external_open_failed, rawUrl))
+                return true
+            }
+
+        val fallbackUrl = intent.getStringExtra("browser_fallback_url")?.takeIf { it.isNotBlank() }
+        val sanitizedIntent =
+            intent.apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                component = null
+                selector = null
+            }
+
+        if (openExternalIntentOnMain(sanitizedIntent)) {
+            return true
+        }
+
+        if (!fallbackUrl.isNullOrBlank()) {
+            navigateSessionOnMain(session, fallbackUrl)
+            return true
+        }
+
+        showToast(context.getString(R.string.web_session_external_open_failed, rawUrl))
+        return true
+    }
+
+    private fun openExternalIntentOnMain(intent: Intent): Boolean {
+        val currentActivity = ActivityLifecycleManager.getCurrentActivity()
+        return try {
+            if (currentActivity != null && !currentActivity.isFinishing && !currentActivity.isDestroyed) {
+                currentActivity.startActivity(Intent(intent))
+            } else {
+                context.applicationContext.startActivity(
+                    Intent(intent).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                )
+            }
+            true
+        } catch (e: ActivityNotFoundException) {
+            AppLogger.w(TAG, "No activity found for external navigation: ${e.message}")
+            false
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "Failed to open external navigation: ${e.message}")
+            false
+        }
+    }
+
+    private fun handleWebPermissionRequest(request: PermissionRequest) {
+        val requestedResources = request.resources?.distinct().orEmpty()
+        if (requestedResources.isEmpty()) {
+            request.deny()
+            return
+        }
+
+        val requiredPermissions =
+            requestedResources
+                .flatMap(::androidPermissionsForWebResource)
+                .toCollection(LinkedHashSet())
+
+        if (requiredPermissions.isEmpty()) {
+            request.grant(requestedResources.toTypedArray())
+            return
+        }
+
+        ioScope.launch {
+            val permissionResults = ensureAndroidPermissions(requiredPermissions)
+            val grantableResources =
+                requestedResources
+                    .filter { resource ->
+                        val required = androidPermissionsForWebResource(resource)
+                        required.isEmpty() || required.all { permissionResults[it] == true }
+                    }
+                    .toTypedArray()
+
+            mainHandler.post {
+                if (grantableResources.isNotEmpty()) {
+                    request.grant(grantableResources)
+                } else {
+                    request.deny()
+                    showToast(context.getString(R.string.web_session_permission_denied))
+                }
+            }
+        }
+    }
+
+    private fun handleGeolocationPermissionRequest(
+        origin: String,
+        callback: GeolocationPermissions.Callback
+    ) {
+        ioScope.launch {
+            val permissionResults =
+                ensureAndroidPermissions(
+                    listOf(
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
+            val granted =
+                permissionResults[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                    permissionResults[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+
+            mainHandler.post {
+                callback.invoke(origin, granted, false)
+                if (!granted) {
+                    showToast(context.getString(R.string.web_session_location_permission_denied))
+                }
+            }
+        }
+    }
+
+    private suspend fun ensureAndroidPermissions(
+        permissions: Collection<String>
+    ): Map<String, Boolean> {
+        val requested =
+            permissions
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+        if (requested.isEmpty()) {
+            return emptyMap()
+        }
+
+        val currentResults =
+            requested.associateWith { permission ->
+                ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+            }
+        val missingPermissions = currentResults.filterValues { granted -> !granted }.keys
+        if (missingPermissions.isEmpty()) {
+            return currentResults
+        }
+
+        val requestedResults =
+            WebSessionPermissionRequestCoordinator.requestPermissions(
+                context = context.applicationContext,
+                permissions = missingPermissions
+            )
+
+        return requested.associateWith { permission ->
+            currentResults[permission] == true || requestedResults[permission] == true
+        }
+    }
+
+    private fun androidPermissionsForWebResource(resource: String): List<String> =
+        when (resource) {
+            PermissionRequest.RESOURCE_AUDIO_CAPTURE -> listOf(Manifest.permission.RECORD_AUDIO)
+            PermissionRequest.RESOURCE_VIDEO_CAPTURE -> listOf(Manifest.permission.CAMERA)
+            else -> emptyList()
+        }
+
+    private fun showToast(message: String) {
+        if (message.isBlank()) {
+            return
+        }
+        mainHandler.post {
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun setDesktopModeEnabled(enabled: Boolean) {
+        if (desktopModeEnabled == enabled) {
+            return
+        }
+
+        desktopModeEnabled = enabled
+        ioScope.launch {
+            historyStore.setDesktopMode(enabled)
+        }
+
+        runOnMainSync {
+            sessions.values.forEach { session ->
+                if (session.customUserAgent == null) {
+                    applySessionUserAgent(session, resolveUserAgent(null))
+                }
+            }
+
+            val activeSession = getActiveSessionOnMain()
+            if (activeSession != null && activeSession.customUserAgent == null) {
+                activeSession.pageLoaded = false
+                activeSession.isLoading = true
+                activeSession.webView.reload()
+                refreshNavigationStateAsync(activeSession)
+            } else {
+                refreshSessionUiOnMain(activeSession?.id)
+            }
+        }
     }
 
     private fun closeSession(sessionId: String): Boolean {
@@ -1909,14 +1794,9 @@ private class WebSessionOverlayLifecycleOwner :
         removeSessionOrder(sessionId)
 
         runOnMainSync {
-            val controller = overlayController
-
-            if (controller != null) {
-                if (controller.activeSessionId == sessionId) {
-                    controller.webContainer.removeAllViews()
-                    controller.activeSessionId = null
-                }
-                removeSessionTabOnMain(controller, sessionId)
+            if (activeSessionId == sessionId) {
+                activeSessionId = null
+                browserHost?.attachActiveWebView(null)
             }
 
             val parent = session.webView.parent
@@ -1927,13 +1807,13 @@ private class WebSessionOverlayLifecycleOwner :
             session.pendingFileChooserCallback = null
             cleanupWebViewOnMain(session.webView)
 
-            val nextSessionId = listSessionIdsInOrder().firstOrNull()
-            val currentController = overlayController
-            if (nextSessionId != null && currentController != null) {
-                activateSessionOnMain(currentController, nextSessionId)
+            val nextSessionId = listSessionIdsInOrder().firstOrNull { sessions.containsKey(it) }
+            if (nextSessionId != null) {
+                activateSessionOnMain(nextSessionId)
             } else {
                 destroyOverlayOnMain()
             }
+            refreshSessionUiOnMain()
         }
 
         return true
@@ -2419,10 +2299,7 @@ private class WebSessionOverlayLifecycleOwner :
     }
 
     private fun resolvePreferredSessionId(): String? {
-        val activeId =
-            runOnMainSync(timeoutMs = 2_000L) {
-                overlayController?.activeSessionId
-            }
+        val activeId = activeSessionId
 
         if (!activeId.isNullOrBlank() && sessions.containsKey(activeId)) {
             return activeId
@@ -2453,13 +2330,6 @@ private class WebSessionOverlayLifecycleOwner :
     private fun listSessionIdsInOrder(): List<String> {
         synchronized(sessionOrderLock) {
             return sessionOrder.toList()
-        }
-    }
-
-    private fun indexOfSession(sessionId: String): Int {
-        synchronized(sessionOrderLock) {
-            val index = sessionOrder.indexOf(sessionId)
-            return if (index < 0) -1 else index + 1
         }
     }
 
@@ -2508,14 +2378,6 @@ private class WebSessionOverlayLifecycleOwner :
     }
 
     private fun quoteJs(value: String): String = JSONObject.quote(value)
-
-    private fun shorten(text: String, maxLen: Int): String {
-        val cleaned = text.replace("\n", " ").replace(Regex("\\s+"), " ").trim()
-        if (cleaned.length <= maxLen) {
-            return cleaned
-        }
-        return cleaned.take(maxLen - 1) + "…"
-    }
 
     private fun parseHeaders(raw: String?): Map<String, String> {
         if (raw.isNullOrBlank()) {
@@ -2576,11 +2438,6 @@ private class WebSessionOverlayLifecycleOwner :
 
     private fun longParam(tool: AITool, name: String, default: Long): Long {
         return param(tool, name)?.trim()?.toLongOrNull() ?: default
-    }
-
-    private fun dp(value: Int): Int {
-        val density = context.resources.displayMetrics.density
-        return (value * density).toInt()
     }
 
     private fun ok(toolName: String, payload: JSONObject): ToolResult {

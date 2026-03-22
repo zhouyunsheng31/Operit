@@ -89,7 +89,7 @@ fun ExternalHttpChatSettingsScreen(onBackPressed: () -> Unit) {
         """
 curl -X POST "$sampleBaseUrl/api/external-chat" \
   -H "Authorization: Bearer $curlToken" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
   -d '{"message":"你好","response_mode":"sync","show_floating":true}'
         """.trimIndent()
     }
@@ -97,7 +97,7 @@ curl -X POST "$sampleBaseUrl/api/external-chat" \
         """
 curl -X POST "$sampleBaseUrl/api/external-chat" \
   -H "Authorization: Bearer $curlToken" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
   -d '{"message":"你好","response_mode":"async_callback","callback_url":"http://YOUR_PC:8080/callback"}'
         """.trimIndent()
     }

@@ -373,7 +373,7 @@ const remoteOperitTools = (function () {
             Authorization: `Bearer ${config.token}`
         };
         if (body != null) {
-            headers["Content-Type"] = "application/json";
+            headers["Content-Type"] = "application/json; charset=utf-8";
         }
         const response = await Tools.Net.http({
             url: `${config.baseUrl}${path}`,

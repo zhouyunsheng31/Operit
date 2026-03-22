@@ -11,7 +11,7 @@ import com.ai.assistance.operit.integrations.externalchat.ExternalChatResponseMo
 import com.ai.assistance.operit.integrations.externalchat.ExternalChatResult
 import com.ai.assistance.operit.util.AppLogger
 import fi.iki.elonen.NanoHTTPD
-import java.io.File
+import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
@@ -254,15 +254,65 @@ class ExternalChatHttpServer(
 
     private fun readRequestBody(session: IHTTPSession): RequestBodyResult {
         return try {
-            val tempFiles = HashMap<String, String>()
-            session.parseBody(tempFiles)
-            val postDataPath = tempFiles["postData"]
-                ?: return RequestBodyResult(error = "Request body is missing")
-            RequestBodyResult(body = File(postDataPath).readText(StandardCharsets.UTF_8))
+            val contentLength = session.headers.entries.firstOrNull {
+                it.key.equals("content-length", ignoreCase = true)
+            }?.value?.trim()?.toLongOrNull()
+                ?: return RequestBodyResult(error = "Missing or invalid Content-Length")
+            if (contentLength < 0L || contentLength > Int.MAX_VALUE.toLong()) {
+                return RequestBodyResult(error = "Unsupported Content-Length: $contentLength")
+            }
+            if (contentLength == 0L) {
+                return RequestBodyResult(body = "")
+            }
+
+            val bodyBytes = ByteArray(contentLength.toInt())
+            var offset = 0
+            val inputStream = session.inputStream
+            while (offset < bodyBytes.size) {
+                val read = inputStream.read(bodyBytes, offset, bodyBytes.size - offset)
+                if (read < 0) {
+                    return RequestBodyResult(error = "Unexpected end of stream while reading request body")
+                }
+                offset += read
+            }
+
+            val charset = resolveRequestCharset(
+                session.headers.entries.firstOrNull {
+                    it.key.equals("content-type", ignoreCase = true)
+                }?.value
+            )
+            RequestBodyResult(body = String(bodyBytes, charset))
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to read HTTP request body", e)
             RequestBodyResult(error = "Failed to read request body: ${e.message ?: "Unknown error"}")
         }
+    }
+
+    private fun resolveRequestCharset(contentTypeHeader: String?): Charset {
+        val charsetName = contentTypeHeader
+            ?.split(';')
+            ?.asSequence()
+            ?.map { it.trim() }
+            ?.firstOrNull { it.startsWith("charset=", ignoreCase = true) }
+            ?.substringAfter('=')
+            ?.trim()
+            ?.removeSurrounding("\"")
+            ?.takeIf { it.isNotBlank() }
+
+        if (charsetName != null) {
+            return kotlin.runCatching { Charset.forName(charsetName) }
+                .getOrElse {
+                    AppLogger.w(
+                        TAG,
+                        "Unsupported request charset '$charsetName', falling back to UTF-8"
+                    )
+                    StandardCharsets.UTF_8
+                }
+        }
+
+        // application/json is defined as UTF-8 by default; keep requests usable
+        // even when the caller omits `charset=utf-8`.
+        return StandardCharsets.UTF_8
     }
 
     private fun jsonResponse(status: Response.Status, body: ExternalChatResult): Response {

@@ -78,7 +78,7 @@ HTTP 新增字段：
 ```bash
 curl -X POST "http://DEVICE_IP:8094/api/external-chat" \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
   -d '{
     "message": "你好，帮我总结今天的待办",
     "response_mode": "sync",
@@ -109,7 +109,7 @@ curl -X POST "http://DEVICE_IP:8094/api/external-chat" \
 ```bash
 curl -X POST "http://DEVICE_IP:8094/api/external-chat" \
   -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
+  -H "Content-Type: application/json; charset=utf-8" \
   -d '{
     "message": "继续刚才的话题",
     "response_mode": "async_callback",
@@ -140,6 +140,7 @@ AI 完成后，Operit 会向 `callback_url` 发送一次 `POST application/json`
 
 注意：
 
+- JSON 请求体默认按 UTF-8 处理，建议显式发送 `Content-Type: application/json; charset=utf-8`
 - v1 不做重试
 - callback 非 2xx 或网络失败只记日志，不自动补发
 
